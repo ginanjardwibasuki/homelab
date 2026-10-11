@@ -1,14 +1,14 @@
 #!/bin/bash
 # ==============================================================================
 # HOMELAB STACK INSTALLER — ENTERPRISE EDITION
-# Version: 2.1.3-enterprise (robust NC detection + shared folder + YAML fixes)
+# Version: 2.1.4-enterprise (manual install fallback + force-clean config dir)
 # ==============================================================================
 set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="2.1.3-enterprise"
+readonly SCRIPT_VERSION="2.1.4-enterprise"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/homelab-installer.log"
 
@@ -764,6 +764,34 @@ cleanup_stale_nc_config() {
     fi
 }
 
+# ── FIX v2.1.4: Force-clean config/ dir kalau NC belum installed ──
+# Penyebab: entrypoint nextcloud SKIP auto-install kalau ada file apapun di config/
+force_clean_nc_config_dir() {
+    local nc_config_dir="$APP_BASE/nextcloud/app/config"
+    local nc_config_file="$nc_config_dir/config.php"
+
+    if [[ ! -d "$nc_config_dir" ]]; then
+        return 0
+    fi
+
+    # Kalau config.php tidak ada ATAU tidak punya installed=>true → force clean
+    if [[ ! -f "$nc_config_file" ]] || \
+       ! grep -qE "'installed'\s*=>\s*true" "$nc_config_file" 2>/dev/null; then
+
+        log_warn "config/ ada tapi NC belum installed — force clean sebelum deploy"
+        rm -f "$nc_config_file"
+        rm -f "$nc_config_dir/CAN_INSTALL"
+        rm -f "$nc_config_dir/config.php.bak" 2>/dev/null || true
+        # Hapus file sampah lain kecuali .htaccess (dari image)
+        find "$nc_config_dir" -maxdepth 1 -type f \
+            ! -name '.htaccess' ! -name 'config.php' 2>/dev/null \
+            -delete 2>/dev/null || true
+        log_ok "  Config dir dibersihkan."
+    else
+        log_ok "  config.php sudah installed:true — biarkan."
+    fi
+}
+
 phase_deploy() {
     log_step "PHASE 4: Deploy containers"
 
@@ -771,6 +799,7 @@ phase_deploy() {
     validate_compose
 
     cleanup_stale_nc_config
+    force_clean_nc_config_dir
     cleanup_stale
 
     # ── Cek volume DB Nextcloud, reset kalau rusak ──
@@ -848,13 +877,51 @@ _nc_dump_diagnostics() {
     echo -e "${C_YELLOW}── occ status (as root) ──${C_RESET}"
     docker exec nextcloud php occ status 2>&1 | head -15 | sed 's/^/    /' || true
     echo ""
+    echo -e "${C_YELLOW}── config/ dir contents ──${C_RESET}"
+    docker exec nextcloud ls -la /var/www/html/config/ 2>&1 | sed 's/^/    /' || true
+    echo ""
     echo -e "${C_YELLOW}── config.php installed flag ──${C_RESET}"
     docker exec nextcloud grep -E "'installed'" \
         /var/www/html/config/config.php 2>&1 | sed 's/^/    /' || true
     echo ""
+    echo -e "${C_YELLOW}── Env var (MYSQL/NEXTCLOUD) ──${C_RESET}"
+    docker exec nextcloud env 2>/dev/null \
+        | grep -E '^(NEXTCLOUD_|MYSQL_)' \
+        | sed -E 's/(PASSWORD=).*/\1***/' \
+        | sed 's/^/    /' || true
+    echo ""
     echo -e "${C_YELLOW}── HTTP status.php ──${C_RESET}"
     docker exec nextcloud curl -s --max-time 5 http://localhost/status.php 2>&1 | sed 's/^/    /' || true
     echo ""
+}
+
+# ── FIX v2.1.4: Manual install fallback ──
+nc_manual_install() {
+    log_info "Menjalankan MANUAL install Nextcloud (occ maintenance:install)..."
+
+    # Beri kesempatan entrypoint NC selesai dulu
+    sleep 3
+
+    local log_file="/tmp/nc_manual_install.log"
+    docker exec --user www-data nextcloud php occ maintenance:install \
+        --database mysql \
+        --database-host nextcloud-db \
+        --database-name nextcloud \
+        --database-user nextcloud \
+        --database-pass "$INPUT_PASSWORD" \
+        --admin-user admin \
+        --admin-pass "$INPUT_PASSWORD" \
+        --admin-email "admin@localhost" > "$log_file" 2>&1
+    local rc=$?
+
+    if (( rc == 0 )); then
+        log_ok "Manual install BERHASIL."
+        return 0
+    fi
+
+    log_err "Manual install GAGAL (exit=$rc). Log:"
+    tail -30 "$log_file" | sed 's/^/    /'
+    return 1
 }
 
 phase_wait_ready() {
@@ -863,6 +930,7 @@ phase_wait_ready() {
     local elapsed=0
     local err_pattern='Access denied|SQLSTATE\[|Cannot connect|Connection refused|Error while trying to create admin user|Unhandled exception|Fatal error'
     local diag_shown=0
+    local manual_install_tried=0
 
     while (( elapsed < NC_READY_TIMEOUT )); do
         if nc_is_installed; then
@@ -871,13 +939,29 @@ phase_wait_ready() {
             return 0
         fi
 
-        # ── Setelah 60s belum ready, tampilkan diagnosa sekali ──
+        # ── Diagnosa pertama @60s ──
         if (( elapsed == 60 && diag_shown == 0 )); then
             diag_shown=1
-            log_warn "Belum terdeteksi ready setelah 60s — menjalankan diagnosa occ..."
+            log_warn "Belum ready @60s — menjalankan diagnosa..."
             _nc_dump_diagnostics "DIAGNOSA @60s"
-            log_info "Lanjut polling... (kalau HTTP status.php says installed:true, next poll akan sukses)"
-            echo ""
+        fi
+
+        # ── FIX v2.1.4: Manual install fallback @90s kalau entrypoint skip ──
+        if (( elapsed >= 90 && manual_install_tried == 0 )); then
+            manual_install_tried=1
+
+            # Cek apakah Apache sudah running (entrypoint selesai)
+            if docker exec nextcloud curl -sf --max-time 5 http://localhost/status.php >/dev/null 2>&1; then
+                log_warn "Entrypoint NC selesai tapi installed:false — coba manual install..."
+                if nc_manual_install; then
+                    sleep 5
+                    # Loop akan cek nc_is_installed di iterasi berikutnya
+                else
+                    log_err "Manual install gagal — akan tetap polling sampai timeout."
+                fi
+            else
+                log_info "Apache belum running — tunggu entrypoint selesai dulu."
+            fi
         fi
 
         if docker logs nextcloud --tail 100 2>&1 | grep -qiE "$err_pattern"; then
@@ -919,11 +1003,13 @@ phase_wait_ready() {
     docker logs nextcloud --tail 30 2>&1 | sed 's/^/    /' || true
     echo ""
 
-    log_err "Kalau occ error tapi HTTP status.php OK → Nextcloud SEBENARNYA sudah ready."
-    log_err "Kemungkinan bug occ di image NC (PHP versi terlalu baru)."
-    echo ""
+    if [[ -f /tmp/nc_manual_install.log ]]; then
+        echo -e "${C_YELLOW}── Manual install log ──${C_RESET}"
+        tail -30 /tmp/nc_manual_install.log | sed 's/^/    /' || true
+        echo ""
+    fi
+
     log_info "Coba akses manual: http://${SERVER_IP}:8080"
-    log_info "Kalau bisa login → Nextcloud SUDAH jadi, tinggal jalankan ulang installer (idempotent)."
     return 1
 }
 
@@ -1164,7 +1250,7 @@ cat > "$TMP_DIR/meta/BACKUP_INFO.txt" <<INFO
 Backup Timestamp : $TIMESTAMP
 Hostname         : $(hostname)
 Backup Type      : SMART (DB + Config + Addons)
-Script Version   : 2.1.3-smart
+Script Version   : 2.1.4-smart
 
 Included:
   databases/nextcloud.sql        — MariaDB logical dump
