@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
 # HOMELAB STACK INSTALLER — ENTERPRISE EDITION
-# Version: 2.2.0-enterprise (stable v2.1.1 base + NC↔Immich shared folder)
+# Version: 2.2.0-enterprise (stable v2.1.1 + NC↔Immich shared folder)
 # ==============================================================================
 set -euo pipefail
 
@@ -545,6 +545,7 @@ phase_provision() {
     log_ok "Layout:"
     echo -e "    ${C_GREY}SSD:${C_RESET}      $DATA_BASE"
     echo -e "    ${C_GREY}Local:${C_RESET}    $APP_BASE"
+    echo -e "    ${C_GREY}Shared:${C_RESET}   $SHARED_PHOTOS_DIR"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -555,6 +556,7 @@ write_compose() {
     mkdir -p "$COMPOSE_DIR"
 
     # ── Escape password untuk YAML double-quoted string ──
+    # Rule: \ → \\, " → \", $ → $$ (untuk Docker Compose interpolation)
     local pw_escaped
     pw_escaped=$(printf '%s' "$INPUT_PASSWORD" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\$/$$/g')
 
@@ -694,6 +696,7 @@ services:
       - /mnt/external_ssd/homelab_data/jellyfin/media:/media
 EOF
 
+    # Sanity check: TAB
     if grep -qP '\t' "$COMPOSE_FILE" 2>/dev/null; then
         log_err "File $COMPOSE_FILE mengandung TAB — YAML tidak mengizinkan!"
         log_err "Baris bermasalah:"
@@ -730,7 +733,7 @@ cleanup_stale() {
     done
 }
 
-# ── Bersihkan config.php stale kalau DB kosong ──
+# ── FIX v2.1.1: Bersihkan config.php stale kalau DB kosong ──
 cleanup_stale_nc_config() {
     local nc_config="$APP_BASE/nextcloud/app/config/config.php"
 
@@ -740,6 +743,7 @@ cleanup_stale_nc_config() {
 
     log_warn "config.php lama terdeteksi — cek apakah DB punya schema..."
 
+    # Cek apakah DB sudah punya tabel Nextcloud (oc_*)
     local db_has_schema=0
     if docker ps --format '{{.Names}}' | grep -qx "nextcloud_db"; then
         if docker exec nextcloud_db mariadb -u nextcloud -p"$INPUT_PASSWORD" \
@@ -766,9 +770,12 @@ phase_deploy() {
     write_compose
     validate_compose
 
+    # FIX v2.1.1: Bersihkan config.php stale SEBELUM cleanup_stale
     cleanup_stale_nc_config
+
     cleanup_stale
 
+    # ── Cek volume DB Nextcloud, reset kalau rusak ──
     local nc_db_dir="$APP_BASE/nextcloud/db"
     if [[ -d "$nc_db_dir/mysql" ]] && [[ ! -f "$nc_db_dir/mysql/ibdata1" ]]; then
         log_warn "Volume DB Nextcloud tidak lengkap (ibdata1 hilang) — dibersihkan."
@@ -892,6 +899,7 @@ phase_tuning() {
     ' 2>/dev/null || true
     docker exec --user root nextcloud a2enmod headers 2>/dev/null || true
 
+    # ── Shared folder NC↔Immich — permission + scan ──
     log_info "Setup shared folder NC↔Immich..."
     if [[ -d "$SHARED_PHOTOS_DIR" ]]; then
         chown -R 33:33 "$SHARED_PHOTOS_DIR" 2>/dev/null || true
@@ -1700,6 +1708,7 @@ print_summary() {
     echo -e "     Di Immich  : $SHARED_PHOTOS_MOUNT (read-only)"
     echo -e "     ${C_YELLOW}⚠ Aktifkan di:${C_RESET} Immich UI → Administration → External Libraries"
     echo -e "       - Import path: ${C_GREEN}$SHARED_PHOTOS_MOUNT${C_RESET}"
+    echo -e "       - Owner: admin (Immich user)"
     echo ""
     echo -e "  ${C_CYAN}🔐 Credentials${C_RESET}"
     echo -e "     User     : admin"
