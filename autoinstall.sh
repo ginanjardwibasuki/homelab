@@ -1,14 +1,14 @@
 #!/bin/bash
 # ==============================================================================
 # HOMELAB STACK INSTALLER — ENTERPRISE EDITION
-# Version: 2.1.2-enterprise (shared NC↔Immich folder + YAML/permission fixes)
+# Version: 2.1.3-enterprise (robust NC detection + shared folder + YAML fixes)
 # ==============================================================================
 set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="2.1.2-enterprise"
+readonly SCRIPT_VERSION="2.1.3-enterprise"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/homelab-installer.log"
 
@@ -770,13 +770,7 @@ phase_deploy() {
     write_compose
     validate_compose
 
-    # FIX v2.1.1: Bersihkan config.php stale SEBELUM cleanup_stale
-    # (tapi butuh DB running untuk cek schema, jadi urutannya:
-    #  1. Jangan down dulu — cek DB existing
-    #  2. Kalau DB kosong, hapus config.php
-    #  3. Baru deploy)
     cleanup_stale_nc_config
-
     cleanup_stale
 
     # ── Cek volume DB Nextcloud, reset kalau rusak ──
@@ -813,9 +807,54 @@ phase_deploy() {
 # ══════════════════════════════════════════════════════════════════════════════
 # PHASE 5: WAIT READY
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ── FIX v2.1.3: Multi-method NC detection (robust untuk PHP 8.5+) ──
 nc_is_installed() {
-    docker exec --user www-data nextcloud php occ status 2>/dev/null \
-        | grep -q "installed: true"
+    # Method 1: occ status as www-data (primary)
+    if docker exec --user www-data nextcloud php occ status 2>/dev/null \
+            | grep -q "installed: true"; then
+        return 0
+    fi
+
+    # Method 2: occ status as root (fallback permission/PHP bug)
+    if docker exec nextcloud php occ status 2>/dev/null \
+            | grep -q "installed: true"; then
+        return 0
+    fi
+
+    # Method 3: baca config.php langsung (anti-PHP-bug)
+    if docker exec nextcloud grep -qE "'installed'\s*=>\s*true" \
+            /var/www/html/config/config.php 2>/dev/null; then
+        return 0
+    fi
+
+    # Method 4: HTTP /status.php (paling reliable kalau occ broken)
+    if docker exec nextcloud curl -sf --max-time 5 http://localhost/status.php 2>/dev/null \
+            | grep -q '"installed":true'; then
+        return 0
+    fi
+
+    return 1
+}
+
+_nc_dump_diagnostics() {
+    local label="${1:-DIAGNOSA}"
+    echo ""
+    echo -e "${C_YELLOW}═══ ${label} ═══${C_RESET}"
+    echo ""
+    echo -e "${C_YELLOW}── occ status (as www-data) ──${C_RESET}"
+    docker exec --user www-data nextcloud php occ status 2>&1 | head -15 | sed 's/^/    /' || true
+    echo ""
+    echo -e "${C_YELLOW}── occ status (as root) ──${C_RESET}"
+    docker exec nextcloud php occ status 2>&1 | head -15 | sed 's/^/    /' || true
+    echo ""
+    echo -e "${C_YELLOW}── config.php installed flag ──${C_RESET}"
+    docker exec nextcloud grep -E "'installed'" \
+        /var/www/html/config/config.php 2>&1 | sed 's/^/    /' || true
+    echo ""
+    echo -e "${C_YELLOW}── HTTP status.php ──${C_RESET}"
+    docker exec nextcloud curl -s --max-time 5 http://localhost/status.php 2>&1 | sed 's/^/    /' || true
+    echo ""
 }
 
 phase_wait_ready() {
@@ -823,12 +862,22 @@ phase_wait_ready() {
 
     local elapsed=0
     local err_pattern='Access denied|SQLSTATE\[|Cannot connect|Connection refused|Error while trying to create admin user|Unhandled exception|Fatal error'
+    local diag_shown=0
 
     while (( elapsed < NC_READY_TIMEOUT )); do
         if nc_is_installed; then
             echo ""
-            log_ok "Nextcloud ready."
+            log_ok "Nextcloud ready. (@${elapsed}s)"
             return 0
+        fi
+
+        # ── Setelah 60s belum ready, tampilkan diagnosa sekali ──
+        if (( elapsed == 60 && diag_shown == 0 )); then
+            diag_shown=1
+            log_warn "Belum terdeteksi ready setelah 60s — menjalankan diagnosa occ..."
+            _nc_dump_diagnostics "DIAGNOSA @60s"
+            log_info "Lanjut polling... (kalau HTTP status.php says installed:true, next poll akan sukses)"
+            echo ""
         fi
 
         if docker logs nextcloud --tail 100 2>&1 | grep -qiE "$err_pattern"; then
@@ -863,10 +912,18 @@ phase_wait_ready() {
 
     echo ""
     log_err "TIMEOUT setelah ${NC_READY_TIMEOUT}s."
-    echo "── Log Nextcloud (50 terakhir) ──"
-    docker logs nextcloud --tail 50 2>&1 | sed 's/^/    /' || true
-    echo "── Log DB (30 terakhir) ──"
-    docker logs nextcloud_db --tail 30 2>&1 | sed 's/^/    /' || true
+
+    _nc_dump_diagnostics "DIAGNOSA FINAL"
+
+    echo -e "${C_YELLOW}── Log Nextcloud (30 terakhir) ──${C_RESET}"
+    docker logs nextcloud --tail 30 2>&1 | sed 's/^/    /' || true
+    echo ""
+
+    log_err "Kalau occ error tapi HTTP status.php OK → Nextcloud SEBENARNYA sudah ready."
+    log_err "Kemungkinan bug occ di image NC (PHP versi terlalu baru)."
+    echo ""
+    log_info "Coba akses manual: http://${SERVER_IP}:8080"
+    log_info "Kalau bisa login → Nextcloud SUDAH jadi, tinggal jalankan ulang installer (idempotent)."
     return 1
 }
 
@@ -1107,7 +1164,7 @@ cat > "$TMP_DIR/meta/BACKUP_INFO.txt" <<INFO
 Backup Timestamp : $TIMESTAMP
 Hostname         : $(hostname)
 Backup Type      : SMART (DB + Config + Addons)
-Script Version   : 2.1.2-smart
+Script Version   : 2.1.3-smart
 
 Included:
   databases/nextcloud.sql        — MariaDB logical dump
@@ -1470,7 +1527,8 @@ STACK_STOPPED=0
 log "     Tunggu Nextcloud ready (maks 180s)..."
 NC_READY=0
 for _ in $(seq 1 60); do
-    if docker exec --user www-data nextcloud php occ status 2>/dev/null | grep -q "installed: true"; then
+    if docker exec --user www-data nextcloud php occ status 2>/dev/null | grep -q "installed: true" \
+    || docker exec nextcloud curl -sf http://localhost/status.php 2>/dev/null | grep -q '"installed":true'; then
         NC_READY=1
         break
     fi
@@ -1684,7 +1742,7 @@ phase_healthcheck() {
         fi
     done
 
-    if docker exec --user www-data nextcloud php occ status 2>/dev/null | grep -q "installed: true"; then
+    if nc_is_installed; then
         log_ok "  Nextcloud: installed"
     else
         log_warn "  Nextcloud: belum terinstall"
