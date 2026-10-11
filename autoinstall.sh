@@ -515,8 +515,8 @@ EOF
 phase_provision() {
     log_step "PHASE 3: Storage provisioning"
 
-    mkdir -p "$DATA_BASE/nextcloud/data"
-    mkdir -p "$DATA_BASE/immich/library"
+    mkdir -p "$DATA_BASE/nextcloud/storage/galeri"
+    mkdir -p "$DATA_BASE/nextcloud/storage/media"
     mkdir -p "$DATA_BASE/jellyfin/media"
 
     mkdir -p "$APP_BASE/nextcloud/app"
@@ -527,9 +527,9 @@ phase_provision() {
     mkdir -p "$RESTORE_DIR"
 
     chown -R 33:33     "$APP_BASE/nextcloud/app"     2>/dev/null || true
-    chown -R 33:33     "$DATA_BASE/nextcloud/data"   2>/dev/null || true
+    chown -R 33:33     "$DATA_BASE/nextcloud/storage/galeri"   2>/dev/null || true
+    chown -R 33:33     "$DATA_BASE/nextcloud/storage/media"   2>/dev/null || true
     chown -R 999:999   "$APP_BASE/nextcloud/db"      2>/dev/null || true
-    chown -R 1000:1000 "$DATA_BASE/immich/library"   2>/dev/null || true
     chown -R 999:999   "$APP_BASE/immich/postgres"   2>/dev/null || true
     chmod -R 700       "$APP_BASE/immich/postgres"   2>/dev/null || true
 
@@ -583,7 +583,9 @@ services:
       APACHE_BODY_LIMIT: 0
     volumes:
       - /root/homelab/nextcloud/app:/var/www/html
-      - /mnt/external_ssd/homelab_data/nextcloud/data:/var/www/html/data
+      - /mnt/external_ssd/homelab_data/nextcloud/storage:/var/www/html/data/admin/files
+      - /mnt/external_ssd/homelab_data/nextcloud/storage:/var/www/html/data/ginanjar/files
+      - /mnt/external_ssd/homelab_data/nextcloud/storage:/var/www/html/data/galuh/files
     depends_on:
       nextcloud-db:
         condition: service_healthy
@@ -640,7 +642,7 @@ services:
       DB_DATABASE_NAME: immich
       REDIS_HOSTNAME: immich-redis
     volumes:
-      - /mnt/external_ssd/homelab_data/immich/library:/usr/src/app/upload/library
+      - /mnt/external_ssd/homelab_data/nextcloud/storage/galeri:/usr/src/app/upload/library
       - /etc/localtime:/etc/localtime:ro
     depends_on:
       immich-redis:
@@ -682,7 +684,7 @@ services:
     volumes:
       - /root/homelab/jellyfin/config:/config
       - /root/homelab/jellyfin/cache:/cache
-      - /mnt/external_ssd/homelab_data/jellyfin/media:/media
+      - /mnt/external_ssd/homelab_data/nextcloud/storage/media:/media
 EOF
 
     # Sanity check: TAB
