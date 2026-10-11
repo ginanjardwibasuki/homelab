@@ -527,7 +527,8 @@ phase_provision() {
     mkdir -p "$RESTORE_DIR"
 
     chown -R 33:33     "$APP_BASE/nextcloud/app"     2>/dev/null || true
-    chown -R 33:33     "$DATA_BASE/nextcloud/storage/galeri"   2>/dev/null || true
+    chown -R 33:1500     "$DATA_BASE/nextcloud/storage/galeri"   2>/dev/null || true
+    chown -R 2770     "$DATA_BASE/nextcloud/storage/galeri"   2>/dev/null || true
     chown -R 33:33     "$DATA_BASE/nextcloud/storage/media"   2>/dev/null || true
     chown -R 999:999   "$APP_BASE/nextcloud/db"      2>/dev/null || true
     chown -R 999:999   "$APP_BASE/immich/postgres"   2>/dev/null || true
