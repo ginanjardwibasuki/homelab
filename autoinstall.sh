@@ -1,14 +1,14 @@
 #!/bin/bash
 # ==============================================================================
 # HOMELAB STACK INSTALLER — ENTERPRISE EDITION
-# Version: 2.1.1-enterprise (inline password + stale config cleanup)
+# Version: 2.1.2-enterprise (shared NC↔Immich folder + YAML/permission fixes)
 # ==============================================================================
 set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="2.1.1-enterprise"
+readonly SCRIPT_VERSION="2.1.2-enterprise"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/homelab-installer.log"
 
@@ -22,6 +22,10 @@ readonly CONFIG_DIR="/root/config"
 readonly CONFIG_FILE="$CONFIG_DIR/homelab.conf"
 readonly LOCK_FILE="/var/lock/homelab-backup.lock"
 readonly UTIL_DIR="/usr/local/bin"
+
+# Shared folder NC ↔ Immich
+readonly SHARED_PHOTOS_DIR="$DATA_BASE/nextcloud/data/admin/files/Photos"
+readonly SHARED_PHOTOS_MOUNT="/mnt/nc-photos"
 
 readonly MIN_DISK_GB=5
 readonly NC_READY_TIMEOUT=300
@@ -515,10 +519,12 @@ EOF
 phase_provision() {
     log_step "PHASE 3: Storage provisioning"
 
+    # ── User data di SSD ──
     mkdir -p "$DATA_BASE/nextcloud/data"
     mkdir -p "$DATA_BASE/immich/library"
     mkdir -p "$DATA_BASE/jellyfin/media"
 
+    # ── App/DB/Config di local disk ──
     mkdir -p "$APP_BASE/nextcloud/app"
     mkdir -p "$APP_BASE/nextcloud/db"
     mkdir -p "$APP_BASE/immich/postgres"
@@ -526,12 +532,16 @@ phase_provision() {
     mkdir -p "$APP_BASE/jellyfin/cache"
     mkdir -p "$RESTORE_DIR"
 
+    # ── Ownership dasar ──
     chown -R 33:33     "$APP_BASE/nextcloud/app"     2>/dev/null || true
     chown -R 33:33     "$DATA_BASE/nextcloud/data"   2>/dev/null || true
     chown -R 999:999   "$APP_BASE/nextcloud/db"      2>/dev/null || true
     chown -R 1000:1000 "$DATA_BASE/immich/library"   2>/dev/null || true
     chown -R 999:999   "$APP_BASE/immich/postgres"   2>/dev/null || true
     chmod -R 700       "$APP_BASE/immich/postgres"   2>/dev/null || true
+
+    # ⚠️  Folder $SHARED_PHOTOS_DIR dibuat di phase_tuning()
+    #     (setelah Nextcloud init skeleton admin/files) agar tidak bentrok.
 
     log_ok "Layout:"
     echo -e "    ${C_GREY}SSD:${C_RESET}      $DATA_BASE"
@@ -642,6 +652,7 @@ services:
     volumes:
       - /mnt/external_ssd/homelab_data/immich/library:/usr/src/app/upload/library
       - /etc/localtime:/etc/localtime:ro
+      - /mnt/external_ssd/homelab_data/nextcloud/data/admin/files/Photos:/mnt/nc-photos:ro
     depends_on:
       immich-redis:
         condition: service_started
@@ -892,6 +903,25 @@ phase_tuning() {
     ' 2>/dev/null || true
     docker exec --user root nextcloud a2enmod headers 2>/dev/null || true
 
+    # ── FIX v2.1.2: Setup shared folder NC↔Immich SETELAH NC init ──
+    log_info "Setup shared folder Nextcloud ↔ Immich..."
+
+    if [[ -d "$SHARED_PHOTOS_DIR" ]]; then
+        log_info "  Folder sudah ada, update permission saja."
+    else
+        mkdir -p "$SHARED_PHOTOS_DIR"
+    fi
+
+    # Owner: www-data (33:33) — Nextcloud bisa write
+    # Group/other: read+traverse — Immich (uid 1000) bisa baca
+    chown -R 33:33 "$SHARED_PHOTOS_DIR" 2>/dev/null || true
+    chmod -R u=rwX,g=rX,o=rX "$SHARED_PHOTOS_DIR" 2>/dev/null || true
+
+    # Scan ulang agar Nextcloud tahu folder baru
+    docker exec --user www-data nextcloud php occ files:scan admin 2>/dev/null || true
+
+    log_ok "  Shared folder siap: $SHARED_PHOTOS_DIR"
+
     log_info "Restart Nextcloud..."
     docker restart nextcloud >/dev/null
     wait_until 90 3 "NC restart" nc_is_installed || true
@@ -1077,7 +1107,7 @@ cat > "$TMP_DIR/meta/BACKUP_INFO.txt" <<INFO
 Backup Timestamp : $TIMESTAMP
 Hostname         : $(hostname)
 Backup Type      : SMART (DB + Config + Addons)
-Script Version   : 2.1.1-smart
+Script Version   : 2.1.2-smart
 
 Included:
   databases/nextcloud.sql        — MariaDB logical dump
@@ -1686,6 +1716,13 @@ print_summary() {
     echo -e "  ${C_CYAN}💾 Storage${C_RESET}"
     echo -e "     User Data  → $DATA_BASE"
     echo -e "     App/DB/Cfg → $APP_BASE"
+    echo ""
+    echo -e "  ${C_CYAN}🔄 Shared Folder (Nextcloud ↔ Immich)${C_RESET}"
+    echo -e "     Folder NC  : $SHARED_PHOTOS_DIR"
+    echo -e "     Di Immich  : $SHARED_PHOTOS_MOUNT (read-only)"
+    echo -e "     ${C_YELLOW}⚠ Aktifkan di:${C_RESET} Immich UI → Administration → External Libraries"
+    echo -e "       - Import path: ${C_GREEN}$SHARED_PHOTOS_MOUNT${C_RESET}"
+    echo -e "       - Owner: admin (Immich user)"
     echo ""
     echo -e "  ${C_CYAN}🔐 Credentials${C_RESET}"
     echo -e "     User     : admin"
