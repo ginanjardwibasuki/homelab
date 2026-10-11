@@ -1,14 +1,14 @@
 #!/bin/bash
 # ==============================================================================
 # HOMELAB STACK INSTALLER — ENTERPRISE EDITION
-# Version: 2.2.1-enterprise (tuning dipisah ke --tuning)
+# Version: 2.3.0-enterprise (mount manager + tuning terpisah)
 # ==============================================================================
 set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="2.2.1-enterprise"
+readonly SCRIPT_VERSION="2.3.0-enterprise"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/homelab-installer.log"
 
@@ -17,14 +17,16 @@ readonly DATA_BASE="$MOUNT_DIR/homelab_data"
 readonly APP_BASE="/root/homelab"
 readonly COMPOSE_DIR="$APP_BASE"
 readonly COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"
+readonly OVERRIDE_FILE="$COMPOSE_DIR/docker-compose.override.yml"
 readonly RESTORE_DIR="/root/restore"
 readonly CONFIG_DIR="/root/config"
 readonly CONFIG_FILE="$CONFIG_DIR/homelab.conf"
+readonly MOUNTS_FILE="$CONFIG_DIR/homelab-mounts.conf"
 readonly LOCK_FILE="/var/lock/homelab-backup.lock"
 readonly UTIL_DIR="/usr/local/bin"
 
 readonly MIN_DISK_GB=5
-readonly NC_READY_TIMEOUT=300
+readonly NC_READY_TIMEOUT=90
 readonly DB_READY_TIMEOUT=180
 readonly TG_MAX_PART_MB=48
 
@@ -139,29 +141,311 @@ prompt_yes_no() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
+# MOUNT MANAGER
+# ══════════════════════════════════════════════════════════════════════════════
+
+mount_list() {
+    echo ""
+    echo -e "${C_CYAN}═══════════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "${C_CYAN}  MOUNT TERDAFTAR — ${MOUNTS_FILE}${C_RESET}"
+    echo -e "${C_CYAN}═══════════════════════════════════════════════════════════════${C_RESET}"
+    echo ""
+
+    if [[ ! -f "$MOUNTS_FILE" ]] || [[ ! -s "$MOUNTS_FILE" ]]; then
+        echo "  (belum ada mount terdaftar)"
+        echo ""
+        echo "  Tambah mount baru:"
+        echo -e "    ${C_GREEN}sudo $SCRIPT_NAME --mount add${C_RESET}"
+        echo ""
+        return 0
+    fi
+
+    printf "  ${C_YELLOW}%-20s %-14s %-42s %-24s %s${C_RESET}\n" \
+        "NAME" "SERVICE" "HOST PATH" "CONTAINER PATH" "MODE"
+    printf "  %-20s %-14s %-42s %-24s %s\n" \
+        "────────────────────" "──────────────" \
+        "──────────────────────────────────────────" \
+        "────────────────────────" "────"
+
+    local count=0
+    while IFS='|' read -r name service host_path container_path mode; do
+        [[ -z "$name" || "$name" =~ ^# ]] && continue
+        printf "  %-20s %-14s %-42s %-24s %s\n" \
+            "$name" "$service" "$host_path" "$container_path" "$mode"
+        count=$((count + 1))
+    done < "$MOUNTS_FILE"
+
+    echo ""
+    echo -e "  Total: ${C_GREEN}${count}${C_RESET} mount(s)"
+    echo ""
+    echo -e "  Hapus mount:"
+    echo -e "    ${C_GREEN}sudo $SCRIPT_NAME --mount delete <name>${C_RESET}"
+    echo ""
+}
+
+mount_add() {
+    echo ""
+    echo -e "${C_CYAN}═══════════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "${C_CYAN}  TAMBAH MOUNT BARU${C_RESET}"
+    echo -e "${C_CYAN}═══════════════════════════════════════════════════════════════${C_RESET}"
+    echo ""
+
+    local name
+    read -rp "  Nama mount (unik, tanpa spasi) : " name
+    if [[ -z "$name" ]]; then
+        log_err "Nama kosong."
+        exit 1
+    fi
+    if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        log_err "Nama hanya boleh huruf, angka, _, -"
+        exit 1
+    fi
+    if [[ -f "$MOUNTS_FILE" ]] && grep -q "^${name}|" "$MOUNTS_FILE"; then
+        log_err "Nama '$name' sudah dipakai."
+        exit 1
+    fi
+
+    local service svc_choice
+    echo ""
+    echo "  Service yang tersedia:"
+    echo "    1) nextcloud"
+    echo "    2) immich-server"
+    echo "    3) jellyfin"
+    echo ""
+    read -rp "  Pilih service [1/2/3]: " svc_choice
+    case "$svc_choice" in
+        1) service="nextcloud" ;;
+        2) service="immich-server" ;;
+        3) service="jellyfin" ;;
+        *) log_err "Pilihan tidak valid."; exit 1 ;;
+    esac
+
+    local host_path
+    echo ""
+    read -rp "  Host path (misal /mnt/external_ssd/media): " host_path
+    if [[ -z "$host_path" ]]; then
+        log_err "Host path kosong."
+        exit 1
+    fi
+    if [[ ! "$host_path" =~ ^/ ]]; then
+        log_err "Host path harus absolute (dimulai /)"
+        exit 1
+    fi
+
+    echo ""
+    echo "  Container path — rekomendasi:"
+    case "$service" in
+        nextcloud)     echo "    /mnt/shared  (atau subfolder /mnt/shared/family)" ;;
+        immich-server) echo "    /mnt/nc-photos  /mnt/family-photos" ;;
+        jellyfin)      echo "    /media/movies  /media/music" ;;
+    esac
+    echo ""
+    local container_path
+    read -rp "  Container path: " container_path
+    if [[ -z "$container_path" ]]; then
+        log_err "Container path kosong."
+        exit 1
+    fi
+
+    if [[ "$service" == "nextcloud" ]] && \
+       [[ "$container_path" =~ ^/var/www/html/data/ ]]; then
+        log_err "❌ DILARANG bind mount ke /var/www/html/data/*"
+        log_err "   Ini akan BLOCKER install Nextcloud (folder user dianggap exist)."
+        log_err ""
+        log_err "   Pakai: ${C_GREEN}/mnt/shared${C_RESET} lalu aktifkan via"
+        log_err "   Nextcloud UI → Settings → External Storage"
+        exit 1
+    fi
+
+    local mode
+    echo ""
+    read -rp "  Mode [ro/rw] (default ro): " mode
+    mode="${mode:-ro}"
+    case "$mode" in
+        ro|rw) ;;
+        *) log_err "Mode harus 'ro' atau 'rw'."; exit 1 ;;
+    esac
+
+    echo ""
+    log_info "Membuat folder: $host_path"
+    mkdir -p "$host_path"
+
+    case "$service" in
+        nextcloud)
+            chown -R 33:33 "$host_path" 2>/dev/null || true
+            log_info "  Owner: www-data (33:33)"
+            ;;
+        immich-server|jellyfin)
+            chown -R 1000:1000 "$host_path" 2>/dev/null || true
+            log_info "  Owner: uid 1000"
+            ;;
+    esac
+
+    mkdir -p "$CONFIG_DIR"
+    echo "${name}|${service}|${host_path}|${container_path}|${mode}" >> "$MOUNTS_FILE"
+    log_ok "Mount '$name' disimpan."
+
+    mount_apply "$service"
+}
+
+mount_delete() {
+    local name="$1"
+
+    if [[ -z "$name" ]]; then
+        echo "Usage: $SCRIPT_NAME --mount delete <name>"
+        exit 1
+    fi
+
+    if [[ ! -f "$MOUNTS_FILE" ]] || ! grep -q "^${name}|" "$MOUNTS_FILE"; then
+        log_err "Mount '$name' tidak ditemukan."
+        echo ""
+        echo "Daftar mount:"
+        mount_list
+        exit 1
+    fi
+
+    local service
+    service=$(grep "^${name}|" "$MOUNTS_FILE" | head -1 | cut -d'|' -f2)
+
+    echo ""
+    echo -e "${C_YELLOW}Mount yang akan dihapus:${C_RESET}"
+    grep "^${name}|" "$MOUNTS_FILE" | while IFS='|' read -r n s h c m; do
+        echo "  Name     : $n"
+        echo "  Service  : $s"
+        echo "  Host     : $h"
+        echo "  Container: $c"
+        echo "  Mode     : $m"
+    done
+    echo ""
+    echo -e "${C_YELLOW}⚠️  Data di host path TIDAK dihapus — hanya unmount.${C_RESET}"
+    echo ""
+    read -rp "  Lanjut hapus mount '$name'? [y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || { echo "Dibatalkan."; exit 0; }
+
+    local tmp="${MOUNTS_FILE}.tmp.$$"
+    grep -v "^${name}|" "$MOUNTS_FILE" > "$tmp" || true
+    mv "$tmp" "$MOUNTS_FILE"
+
+    if [[ ! -s "$MOUNTS_FILE" ]]; then
+        rm -f "$MOUNTS_FILE"
+    fi
+
+    log_ok "Mount '$name' dihapus dari config."
+
+    mount_apply "$service"
+}
+
+mount_apply() {
+    local service="$1"
+
+    mount_regenerate_override
+
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        log_warn "docker-compose.yml belum ada — mount akan diterapkan saat install berikutnya."
+        return 0
+    fi
+
+    if ! docker ps --format '{{.Names}}' | grep -q .; then
+        log_warn "Tidak ada container running — mount akan diterapkan saat start berikutnya."
+        return 0
+    fi
+
+    log_info "Recreate service: $service"
+    cd "$COMPOSE_DIR"
+    docker compose up -d --force-recreate "$service" 2>/dev/null || {
+        log_err "Gagal recreate '$service'."
+        return 1
+    }
+
+    log_ok "Service '$service' di-recreate dengan mount baru."
+}
+
+mount_regenerate_override() {
+    if [[ ! -f "$MOUNTS_FILE" ]] || [[ ! -s "$MOUNTS_FILE" ]]; then
+        if [[ -f "$OVERRIDE_FILE" ]]; then
+            rm -f "$OVERRIDE_FILE"
+            log_info "Override file dihapus (tidak ada mount)."
+        fi
+        return 0
+    fi
+
+    local out
+    out="$(cat <<EOF
+# Auto-generated by $SCRIPT_NAME mount manager
+# JANGAN edit manual — pakai:
+#   $SCRIPT_NAME --mount add
+#   $SCRIPT_NAME --mount delete <name>
+#   $SCRIPT_NAME --mount list
+
+services:
+EOF
+)"
+
+    local svc
+    for svc in "nextcloud" "immich-server" "jellyfin"; do
+        local svc_mounts
+        svc_mounts=$(grep "|${svc}|" "$MOUNTS_FILE" 2>/dev/null || true)
+        [[ -z "$svc_mounts" ]] && continue
+
+        out+=$'\n'"  ${svc}:"$'\n'"    volumes:"
+        while IFS='|' read -r name s host_path container_path mode; do
+            [[ "$s" != "$svc" ]] && continue
+            out+=$'\n'"      - ${host_path}:${container_path}:${mode}"
+        done <<< "$svc_mounts"
+    done
+
+    echo "$out" > "$OVERRIDE_FILE"
+    log_ok "Override file di-generate: $OVERRIDE_FILE"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CLI ARGS
 # ══════════════════════════════════════════════════════════════════════════════
 parse_args() {
-    local arg
-    for arg in "$@"; do
-        case "$arg" in
-            --reset|-r)   RESET_MODE=1 ;;
-            --check|-c)   CHECK_ONLY=1 ;;
-            --tuning|-t)  TUNING_MODE=1 ;;
+    while (( $# > 0 )); do
+        case "$1" in
+            --reset|-r)
+                RESET_MODE=1; shift ;;
+            --check|-c)
+                CHECK_ONLY=1; shift ;;
+            --tuning|-t)
+                TUNING_MODE=1; shift ;;
+            --mount)
+                shift
+                local subcmd="${1:-list}"
+                shift || true
+                case "$subcmd" in
+                    list)
+                        mount_list ;;
+                    add)
+                        mount_add ;;
+                    delete|rm|remove)
+                        mount_delete "${1:-}" ;;
+                    *)
+                        echo "Usage: $SCRIPT_NAME --mount {list|add|delete <name>}"
+                        exit 1 ;;
+                esac
+                exit 0 ;;
             --help|-h)
                 cat <<EOF
 Usage: $SCRIPT_NAME [OPTIONS]
 
 Options:
-  (tanpa opsi)   Install / re-run idempotent (tanpa tuning)
-  --reset, -r    Hapus semua container + data, install dari nol
-  --check, -c    Hanya pre-flight check (tidak install)
-  --tuning, -t   Wait ready + tuning Nextcloud saja (tanpa install)
-  --help, -h     Tampilkan bantuan ini
+  (tanpa opsi)                Install / re-run idempotent (tanpa tuning)
+  --reset, -r                 Hapus semua container + data, install dari nol
+  --check, -c                 Hanya pre-flight check (tidak install)
+  --tuning, -t                Wait ready + tuning Nextcloud saja
+
+  --mount list                Lihat daftar mount terdaftar
+  --mount add                 Tambah mount baru (interaktif)
+  --mount delete <name>       Hapus mount berdasarkan nama
+  --mount rm <name>           Alias untuk delete
+
+  --help, -h                  Tampilkan bantuan ini
 EOF
-                exit 0
-                ;;
-            *) log_warn "Argumen tidak dikenal: $arg" ;;
+                exit 0 ;;
+            *)
+                log_warn "Argumen tidak dikenal: $1"; shift ;;
         esac
     done
 }
@@ -518,8 +802,8 @@ EOF
 phase_provision() {
     log_step "PHASE 3: Storage provisioning"
 
-    mkdir -p "$DATA_BASE/nextcloud/storage/galeri"
-    mkdir -p "$DATA_BASE/nextcloud/storage/media"
+    mkdir -p "$DATA_BASE/nextcloud/storage"
+    mkdir -p "$DATA_BASE/immich/library"
     mkdir -p "$DATA_BASE/jellyfin/media"
 
     mkdir -p "$APP_BASE/nextcloud/app"
@@ -530,9 +814,9 @@ phase_provision() {
     mkdir -p "$RESTORE_DIR"
 
     chown -R 33:33     "$APP_BASE/nextcloud/app"     2>/dev/null || true
-    chown -R 33:1500   "$DATA_BASE/nextcloud/storage/galeri"   2>/dev/null || true
-    chmod -R 2770      "$DATA_BASE/nextcloud/storage/galeri"   2>/dev/null || true
-    chown -R 33:33     "$DATA_BASE/nextcloud/storage/media"   2>/dev/null || true
+    chown -R 33:33     "$DATA_BASE/nextcloud/storage" 2>/dev/null || true
+    chown -R 1000:1000 "$DATA_BASE/immich/library"   2>/dev/null || true
+    chown -R 1000:1000 "$DATA_BASE/jellyfin/media"   2>/dev/null || true
     chown -R 999:999   "$APP_BASE/nextcloud/db"      2>/dev/null || true
     chown -R 999:999   "$APP_BASE/immich/postgres"   2>/dev/null || true
     chmod -R 700       "$APP_BASE/immich/postgres"   2>/dev/null || true
@@ -549,12 +833,9 @@ phase_provision() {
 write_compose() {
     mkdir -p "$COMPOSE_DIR"
 
-    # ── Escape password untuk YAML double-quoted string ──
-    # Rule: \ → \\, " → \", $ → $$ (untuk Docker Compose interpolation)
     local pw_escaped
     pw_escaped=$(printf '%s' "$INPUT_PASSWORD" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\$/$$/g')
 
-    # ⚠️  PENTING: indentasi YAML WAJIB pakai SPASI, bukan TAB.
     cat > "$COMPOSE_FILE" <<EOF
 name: homelab-stack
 
@@ -587,9 +868,7 @@ services:
       APACHE_BODY_LIMIT: 0
     volumes:
       - /root/homelab/nextcloud/app:/var/www/html
-      - /mnt/external_ssd/homelab_data/nextcloud/storage:/var/www/html/data/admin/files
-      - /mnt/external_ssd/homelab_data/nextcloud/storage:/var/www/html/data/ginanjar/files
-      - /mnt/external_ssd/homelab_data/nextcloud/storage:/var/www/html/data/galuh/files
+      - /mnt/external_ssd/homelab_data/nextcloud/data:/var/www/html/data
     depends_on:
       nextcloud-db:
         condition: service_healthy
@@ -646,7 +925,7 @@ services:
       DB_DATABASE_NAME: immich
       REDIS_HOSTNAME: immich-redis
     volumes:
-      - /mnt/external_ssd/homelab_data/nextcloud/storage/galeri:/usr/src/app/upload/library
+      - /mnt/external_ssd/homelab_data/immich/library:/usr/src/app/upload/library
       - /etc/localtime:/etc/localtime:ro
     depends_on:
       immich-redis:
@@ -688,13 +967,11 @@ services:
     volumes:
       - /root/homelab/jellyfin/config:/config
       - /root/homelab/jellyfin/cache:/cache
-      - /mnt/external_ssd/homelab_data/nextcloud/storage/media:/media
+      - /mnt/external_ssd/homelab_data/jellyfin/media:/media
 EOF
 
-    # Sanity check: TAB
     if grep -qP '\t' "$COMPOSE_FILE" 2>/dev/null; then
         log_err "File $COMPOSE_FILE mengandung TAB — YAML tidak mengizinkan!"
-        log_err "Baris bermasalah:"
         grep -nP '\t' "$COMPOSE_FILE" | head -5 | sed 's/^/    /'
         return 1
     fi
@@ -728,7 +1005,6 @@ cleanup_stale() {
     done
 }
 
-# ── Bersihkan config.php stale kalau DB kosong ──
 cleanup_stale_nc_config() {
     local nc_config="$APP_BASE/nextcloud/app/config/config.php"
 
@@ -767,7 +1043,6 @@ phase_deploy() {
     cleanup_stale_nc_config
     cleanup_stale
 
-    # ── Cek volume DB Nextcloud, reset kalau rusak ──
     local nc_db_dir="$APP_BASE/nextcloud/db"
     if [[ -d "$nc_db_dir/mysql" ]] && [[ ! -f "$nc_db_dir/mysql/ibdata1" ]]; then
         log_warn "Volume DB Nextcloud tidak lengkap (ibdata1 hilang) — dibersihkan."
@@ -799,7 +1074,7 @@ phase_deploy() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 5: WAIT READY (dijalankan hanya via --tuning)
+# PHASE 5: WAIT READY (hanya via --tuning)
 # ══════════════════════════════════════════════════════════════════════════════
 nc_is_installed() {
     docker exec --user www-data nextcloud php occ status 2>/dev/null \
@@ -826,14 +1101,6 @@ phase_wait_ready() {
             echo -e "${C_YELLOW}── Error yang terdeteksi ──${C_RESET}"
             docker logs nextcloud --tail 100 2>&1 | grep -iE "$err_pattern" | head -5 | sed 's/^/    /' || true
             echo ""
-            echo -e "${C_YELLOW}── Diagnostik ──${C_RESET}"
-            echo "    1. Cek apakah DB bisa di-ping dari container NC:"
-            echo "       docker exec nextcloud getent hosts nextcloud-db"
-            echo "    2. Cek env var yang masuk ke container:"
-            echo "       docker exec nextcloud env | grep MYSQL"
-            echo "    3. Cek koneksi manual ke DB:"
-            echo "       docker exec nextcloud bash -c 'mysql -h nextcloud-db -u nextcloud -p\"\$MYSQL_PASSWORD\" -e \"SELECT 1;\"'"
-            echo ""
             echo -e "${C_YELLOW}── Solusi ──${C_RESET}"
             echo "    $SCRIPT_NAME --reset"
             return 1
@@ -843,7 +1110,7 @@ phase_wait_ready() {
         elapsed=$((elapsed + 5))
         echo -n "."
 
-        if (( elapsed % 60 == 0 )); then
+        if (( elapsed % 30 == 0 )); then
             echo ""
             log_info "@${elapsed}s: $(docker ps --filter name=nextcloud --format '{{.Names}}={{.Status}}' | tr '\n' ' ')"
         fi
@@ -851,15 +1118,13 @@ phase_wait_ready() {
 
     echo ""
     log_err "TIMEOUT setelah ${NC_READY_TIMEOUT}s."
-    echo "── Log Nextcloud (50 terakhir) ──"
-    docker logs nextcloud --tail 50 2>&1 | sed 's/^/    /' || true
-    echo "── Log DB (30 terakhir) ──"
-    docker logs nextcloud_db --tail 30 2>&1 | sed 's/^/    /' || true
+    echo "── Log Nextcloud (30 terakhir) ──"
+    docker logs nextcloud --tail 30 2>&1 | sed 's/^/    /' || true
     return 1
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 6: TUNING (dijalankan hanya via --tuning)
+# PHASE 6: TUNING (hanya via --tuning)
 # ══════════════════════════════════════════════════════════════════════════════
 phase_tuning() {
     log_step "PHASE 6: Nextcloud tuning"
@@ -1070,13 +1335,19 @@ log "${C_YELLOW}[6/8]${C_RESET} Backup compose + meta..."
 [[ -f "$COMPOSE_DIR/docker-compose.yml" ]] && \
     cp "$COMPOSE_DIR/docker-compose.yml" "$TMP_DIR/compose/docker-compose.yml"
 
+[[ -f "$COMPOSE_DIR/docker-compose.override.yml" ]] && \
+    cp "$COMPOSE_DIR/docker-compose.override.yml" "$TMP_DIR/compose/docker-compose.override.yml"
+
 cp "$CONFIG_FILE" "$TMP_DIR/meta/homelab.conf"
+
+[[ -f "$CONFIG_DIR/homelab-mounts.conf" ]] && \
+    cp "$CONFIG_DIR/homelab-mounts.conf" "$TMP_DIR/meta/homelab-mounts.conf"
 
 cat > "$TMP_DIR/meta/BACKUP_INFO.txt" <<INFO
 Backup Timestamp : $TIMESTAMP
 Hostname         : $(hostname)
 Backup Type      : SMART (DB + Config + Addons)
-Script Version   : 2.2.1-smart
+Script Version   : 2.3.0-smart
 
 Included:
   databases/nextcloud.sql        — MariaDB logical dump
@@ -1086,7 +1357,9 @@ Included:
   nextcloud/apps.json            — occ app:list inventory
   jellyfin/config/               — JF config (tanpa metadata/transcode/cache)
   compose/docker-compose.yml     — Stack definition
+  compose/docker-compose.override.yml — Mount override
   meta/homelab.conf              — Secrets (password, telegram)
+  meta/homelab-mounts.conf       — Mount config
 
 Excluded (auto-rebuilt from Docker image):
   nextcloud/app/                 — Base codebase (~400MB)
@@ -1224,6 +1497,7 @@ readonly CONFIG_FILE="/root/config/homelab.conf"
 readonly APP_BASE="/root/homelab"
 readonly COMPOSE_DIR="$APP_BASE"
 readonly RESTORE_DIR="/root/restore"
+readonly CONFIG_DIR="/root/config"
 
 readonly ALL_CONTAINERS=(nextcloud nextcloud_db nextcloud_redis \
                          immich_server immich_redis immich_postgres jellyfin)
@@ -1298,7 +1572,6 @@ ok "Backup: $LATEST (${SIZE_H}) — tipe: ${BACKUP_TYPE}"
 
 if [[ "$BACKUP_TYPE" != "smart" ]]; then
     warn "Backup ini bukan format 'smart' (v2.1+)."
-    warn "Format lama perlu restore manual. Coba 'autorestore' versi lama."
     exit 1
 fi
 
@@ -1346,7 +1619,7 @@ log "${C_YELLOW}[3/7]${C_RESET} Restore config ke $APP_BASE..."
 NC_APP="$APP_BASE/nextcloud/app"
 JF_CONFIG="$APP_BASE/jellyfin/config"
 
-mkdir -p "$NC_APP/config" "$NC_APP/custom_apps" "$JF_CONFIG" "$COMPOSE_DIR"
+mkdir -p "$NC_APP/config" "$NC_APP/custom_apps" "$JF_CONFIG" "$COMPOSE_DIR" "$CONFIG_DIR"
 
 if [[ -f "$TMP_DIR/nextcloud/config.php" ]]; then
     cp -f "$TMP_DIR/nextcloud/config.php" "$NC_APP/config/config.php"
@@ -1370,10 +1643,20 @@ if [[ -f "$TMP_DIR/compose/docker-compose.yml" ]]; then
     ok "  docker-compose.yml"
 fi
 
+if [[ -f "$TMP_DIR/compose/docker-compose.override.yml" ]]; then
+    cp -f "$TMP_DIR/compose/docker-compose.override.yml" "$COMPOSE_DIR/docker-compose.override.yml"
+    ok "  docker-compose.override.yml"
+fi
+
 if [[ -f "$TMP_DIR/meta/homelab.conf" ]]; then
     cp -f "$TMP_DIR/meta/homelab.conf" "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
     ok "  homelab.conf"
+fi
+
+if [[ -f "$TMP_DIR/meta/homelab-mounts.conf" ]]; then
+    cp -f "$TMP_DIR/meta/homelab-mounts.conf" "$CONFIG_DIR/homelab-mounts.conf"
+    ok "  homelab-mounts.conf"
 fi
 
 chown -R 33:33     "$NC_APP/config"       2>/dev/null || true
@@ -1707,7 +1990,7 @@ main() {
     parse_args "$@"
 
     # ══════════════════════════════════════════════════════════════════
-    # TUNING-ONLY MODE — dijalankan via: autoinstall.sh --tuning
+    # TUNING-ONLY MODE
     # ══════════════════════════════════════════════════════════════════
     if (( TUNING_MODE )); then
         require_root
@@ -1721,7 +2004,15 @@ main() {
             exit 1
         fi
 
-        phase_wait_ready
+        if ! phase_wait_ready; then
+            log_err "Nextcloud belum installed — tuning dibatalkan."
+            log_err ""
+            log_err "Fix instalasi dulu:"
+            log_err "  1. docker exec --user www-data nextcloud php occ status"
+            log_err "  2. Cek log: docker logs nextcloud --tail 50"
+            log_err "  3. Kalau stuck, reset bersih: $SCRIPT_NAME --reset"
+            exit 1
+        fi
         phase_tuning
         phase_healthcheck
 
@@ -1731,7 +2022,7 @@ main() {
     fi
 
     # ══════════════════════════════════════════════════════════════════
-    # NORMAL MODE — Install / Reset (TANPA tuning)
+    # NORMAL MODE — Install / Reset
     # ══════════════════════════════════════════════════════════════════
     phase_preflight
     phase_bootstrap
@@ -1762,8 +2053,7 @@ main() {
     phase_runtime
     phase_provision
     phase_deploy
-    # phase_wait_ready     ← DISKIP dari install
-    # phase_tuning         ← DISKIP dari install
+    mount_regenerate_override
     phase_utilities
     phase_schedule
     phase_healthcheck
