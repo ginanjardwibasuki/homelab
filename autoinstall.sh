@@ -1,14 +1,14 @@
 #!/bin/bash
 # ==============================================================================
 # HOMELAB STACK INSTALLER — ENTERPRISE EDITION
-# Version: 2.1.1-enterprise (inline password + stale config cleanup)
+# Version: 2.2.1-enterprise (tuning dipisah ke --tuning)
 # ==============================================================================
 set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="2.1.1-enterprise"
+readonly SCRIPT_VERSION="2.2.1-enterprise"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/homelab-installer.log"
 
@@ -42,6 +42,7 @@ TG_BOT_TOKEN=""
 TG_CHAT_ID=""
 RESET_MODE=0
 CHECK_ONLY=0
+TUNING_MODE=0
 START_TIME=$(date +%s)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -144,16 +145,18 @@ parse_args() {
     local arg
     for arg in "$@"; do
         case "$arg" in
-            --reset|-r)  RESET_MODE=1 ;;
-            --check|-c)  CHECK_ONLY=1 ;;
+            --reset|-r)   RESET_MODE=1 ;;
+            --check|-c)   CHECK_ONLY=1 ;;
+            --tuning|-t)  TUNING_MODE=1 ;;
             --help|-h)
                 cat <<EOF
 Usage: $SCRIPT_NAME [OPTIONS]
 
 Options:
-  (tanpa opsi)   Install / re-run idempotent
+  (tanpa opsi)   Install / re-run idempotent (tanpa tuning)
   --reset, -r    Hapus semua container + data, install dari nol
   --check, -c    Hanya pre-flight check (tidak install)
+  --tuning, -t   Wait ready + tuning Nextcloud saja (tanpa install)
   --help, -h     Tampilkan bantuan ini
 EOF
                 exit 0
@@ -527,8 +530,8 @@ phase_provision() {
     mkdir -p "$RESTORE_DIR"
 
     chown -R 33:33     "$APP_BASE/nextcloud/app"     2>/dev/null || true
-    chown -R 33:1500     "$DATA_BASE/nextcloud/storage/galeri"   2>/dev/null || true
-    chown -R 2770     "$DATA_BASE/nextcloud/storage/galeri"   2>/dev/null || true
+    chown -R 33:1500   "$DATA_BASE/nextcloud/storage/galeri"   2>/dev/null || true
+    chmod -R 2770      "$DATA_BASE/nextcloud/storage/galeri"   2>/dev/null || true
     chown -R 33:33     "$DATA_BASE/nextcloud/storage/media"   2>/dev/null || true
     chown -R 999:999   "$APP_BASE/nextcloud/db"      2>/dev/null || true
     chown -R 999:999   "$APP_BASE/immich/postgres"   2>/dev/null || true
@@ -725,7 +728,7 @@ cleanup_stale() {
     done
 }
 
-# ── FIX v2.1.1: Bersihkan config.php stale kalau DB kosong ──
+# ── Bersihkan config.php stale kalau DB kosong ──
 cleanup_stale_nc_config() {
     local nc_config="$APP_BASE/nextcloud/app/config/config.php"
 
@@ -735,7 +738,6 @@ cleanup_stale_nc_config() {
 
     log_warn "config.php lama terdeteksi — cek apakah DB punya schema..."
 
-    # Cek apakah DB sudah punya tabel Nextcloud (oc_*)
     local db_has_schema=0
     if docker ps --format '{{.Names}}' | grep -qx "nextcloud_db"; then
         if docker exec nextcloud_db mariadb -u nextcloud -p"$INPUT_PASSWORD" \
@@ -762,13 +764,7 @@ phase_deploy() {
     write_compose
     validate_compose
 
-    # FIX v2.1.1: Bersihkan config.php stale SEBELUM cleanup_stale
-    # (tapi butuh DB running untuk cek schema, jadi urutannya:
-    #  1. Jangan down dulu — cek DB existing
-    #  2. Kalau DB kosong, hapus config.php
-    #  3. Baru deploy)
     cleanup_stale_nc_config
-
     cleanup_stale
 
     # ── Cek volume DB Nextcloud, reset kalau rusak ──
@@ -803,7 +799,7 @@ phase_deploy() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 5: WAIT READY
+# PHASE 5: WAIT READY (dijalankan hanya via --tuning)
 # ══════════════════════════════════════════════════════════════════════════════
 nc_is_installed() {
     docker exec --user www-data nextcloud php occ status 2>/dev/null \
@@ -819,7 +815,7 @@ phase_wait_ready() {
     while (( elapsed < NC_READY_TIMEOUT )); do
         if nc_is_installed; then
             echo ""
-            log_ok "Nextcloud ready."
+            log_ok "Nextcloud ready. (@${elapsed}s)"
             return 0
         fi
 
@@ -863,7 +859,7 @@ phase_wait_ready() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 6: TUNING
+# PHASE 6: TUNING (dijalankan hanya via --tuning)
 # ══════════════════════════════════════════════════════════════════════════════
 phase_tuning() {
     log_step "PHASE 6: Nextcloud tuning"
@@ -1080,7 +1076,7 @@ cat > "$TMP_DIR/meta/BACKUP_INFO.txt" <<INFO
 Backup Timestamp : $TIMESTAMP
 Hostname         : $(hostname)
 Backup Type      : SMART (DB + Config + Addons)
-Script Version   : 2.1.1-smart
+Script Version   : 2.2.1-smart
 
 Included:
   databases/nextcloud.sql        — MariaDB logical dump
@@ -1710,6 +1706,33 @@ main() {
     banner
     parse_args "$@"
 
+    # ══════════════════════════════════════════════════════════════════
+    # TUNING-ONLY MODE — dijalankan via: autoinstall.sh --tuning
+    # ══════════════════════════════════════════════════════════════════
+    if (( TUNING_MODE )); then
+        require_root
+        load_config
+
+        log_step "TUNING MODE — Wait ready + Tuning Nextcloud"
+
+        if ! docker ps --format '{{.Names}}' | grep -qx "nextcloud"; then
+            log_err "Container 'nextcloud' tidak running."
+            log_err "Jalankan install dulu: $SCRIPT_NAME"
+            exit 1
+        fi
+
+        phase_wait_ready
+        phase_tuning
+        phase_healthcheck
+
+        echo ""
+        log_ok "Tuning selesai. Nextcloud siap dipakai."
+        exit 0
+    fi
+
+    # ══════════════════════════════════════════════════════════════════
+    # NORMAL MODE — Install / Reset (TANPA tuning)
+    # ══════════════════════════════════════════════════════════════════
     phase_preflight
     phase_bootstrap
 
@@ -1739,13 +1762,24 @@ main() {
     phase_runtime
     phase_provision
     phase_deploy
-    phase_wait_ready
-    phase_tuning
+    # phase_wait_ready     ← DISKIP dari install
+    # phase_tuning         ← DISKIP dari install
     phase_utilities
     phase_schedule
     phase_healthcheck
 
     print_summary
+
+    echo ""
+    echo -e "${C_YELLOW}═══════════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "${C_YELLOW}  ⚠️  Nextcloud sedang initialisasi di background${C_RESET}"
+    echo -e "${C_YELLOW}═══════════════════════════════════════════════════════════════${C_RESET}"
+    echo ""
+    echo -e "  Tunggu ~1-2 menit, lalu jalankan:"
+    echo -e "     ${C_GREEN}sudo $SCRIPT_NAME --tuning${C_RESET}"
+    echo ""
+    echo -e "  Untuk menyelesaikan setup + tuning Nextcloud."
+    echo ""
 }
 
 main "$@"
