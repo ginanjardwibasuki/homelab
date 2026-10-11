@@ -1,14 +1,14 @@
 #!/bin/bash
 # ==============================================================================
 # HOMELAB STACK INSTALLER — ENTERPRISE EDITION
-# Version: 2.1.1-enterprise (inline password + stale config cleanup)
+# Version: 2.2.0-enterprise (stable v2.1.1 base + NC↔Immich shared folder)
 # ==============================================================================
 set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="2.1.1-enterprise"
+readonly SCRIPT_VERSION="2.2.0-enterprise"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/homelab-installer.log"
 
@@ -22,6 +22,10 @@ readonly CONFIG_DIR="/root/config"
 readonly CONFIG_FILE="$CONFIG_DIR/homelab.conf"
 readonly LOCK_FILE="/var/lock/homelab-backup.lock"
 readonly UTIL_DIR="/usr/local/bin"
+
+# Shared folder NC ↔ Immich
+readonly SHARED_PHOTOS_DIR="$DATA_BASE/nextcloud/data/admin/files/Photos"
+readonly SHARED_PHOTOS_MOUNT="/mnt/nc-photos"
 
 readonly MIN_DISK_GB=5
 readonly NC_READY_TIMEOUT=300
@@ -533,6 +537,11 @@ phase_provision() {
     chown -R 999:999   "$APP_BASE/immich/postgres"   2>/dev/null || true
     chmod -R 700       "$APP_BASE/immich/postgres"   2>/dev/null || true
 
+    # Shared folder NC↔Immich — pre-create dengan ownership www-data
+    mkdir -p "$SHARED_PHOTOS_DIR"
+    chown -R 33:33 "$SHARED_PHOTOS_DIR" 2>/dev/null || true
+    chmod -R u=rwx,g=rx,o=rx "$SHARED_PHOTOS_DIR" 2>/dev/null || true
+
     log_ok "Layout:"
     echo -e "    ${C_GREY}SSD:${C_RESET}      $DATA_BASE"
     echo -e "    ${C_GREY}Local:${C_RESET}    $APP_BASE"
@@ -546,7 +555,6 @@ write_compose() {
     mkdir -p "$COMPOSE_DIR"
 
     # ── Escape password untuk YAML double-quoted string ──
-    # Rule: \ → \\, " → \", $ → $$ (untuk Docker Compose interpolation)
     local pw_escaped
     pw_escaped=$(printf '%s' "$INPUT_PASSWORD" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\$/$$/g')
 
@@ -642,6 +650,7 @@ services:
     volumes:
       - /mnt/external_ssd/homelab_data/immich/library:/usr/src/app/upload/library
       - /etc/localtime:/etc/localtime:ro
+      - /mnt/external_ssd/homelab_data/nextcloud/data/admin/files/Photos:/mnt/nc-photos:ro
     depends_on:
       immich-redis:
         condition: service_started
@@ -685,7 +694,6 @@ services:
       - /mnt/external_ssd/homelab_data/jellyfin/media:/media
 EOF
 
-    # Sanity check: TAB
     if grep -qP '\t' "$COMPOSE_FILE" 2>/dev/null; then
         log_err "File $COMPOSE_FILE mengandung TAB — YAML tidak mengizinkan!"
         log_err "Baris bermasalah:"
@@ -722,7 +730,7 @@ cleanup_stale() {
     done
 }
 
-# ── FIX v2.1.1: Bersihkan config.php stale kalau DB kosong ──
+# ── Bersihkan config.php stale kalau DB kosong ──
 cleanup_stale_nc_config() {
     local nc_config="$APP_BASE/nextcloud/app/config/config.php"
 
@@ -732,7 +740,6 @@ cleanup_stale_nc_config() {
 
     log_warn "config.php lama terdeteksi — cek apakah DB punya schema..."
 
-    # Cek apakah DB sudah punya tabel Nextcloud (oc_*)
     local db_has_schema=0
     if docker ps --format '{{.Names}}' | grep -qx "nextcloud_db"; then
         if docker exec nextcloud_db mariadb -u nextcloud -p"$INPUT_PASSWORD" \
@@ -759,16 +766,9 @@ phase_deploy() {
     write_compose
     validate_compose
 
-    # FIX v2.1.1: Bersihkan config.php stale SEBELUM cleanup_stale
-    # (tapi butuh DB running untuk cek schema, jadi urutannya:
-    #  1. Jangan down dulu — cek DB existing
-    #  2. Kalau DB kosong, hapus config.php
-    #  3. Baru deploy)
     cleanup_stale_nc_config
-
     cleanup_stale
 
-    # ── Cek volume DB Nextcloud, reset kalau rusak ──
     local nc_db_dir="$APP_BASE/nextcloud/db"
     if [[ -d "$nc_db_dir/mysql" ]] && [[ ! -f "$nc_db_dir/mysql/ibdata1" ]]; then
         log_warn "Volume DB Nextcloud tidak lengkap (ibdata1 hilang) — dibersihkan."
@@ -891,6 +891,14 @@ phase_tuning() {
         fi
     ' 2>/dev/null || true
     docker exec --user root nextcloud a2enmod headers 2>/dev/null || true
+
+    log_info "Setup shared folder NC↔Immich..."
+    if [[ -d "$SHARED_PHOTOS_DIR" ]]; then
+        chown -R 33:33 "$SHARED_PHOTOS_DIR" 2>/dev/null || true
+        chmod -R u=rwX,g=rX,o=rX "$SHARED_PHOTOS_DIR" 2>/dev/null || true
+        docker exec --user www-data nextcloud php occ files:scan admin 2>/dev/null || true
+        log_ok "  Shared folder siap: $SHARED_PHOTOS_DIR"
+    fi
 
     log_info "Restart Nextcloud..."
     docker restart nextcloud >/dev/null
@@ -1077,7 +1085,7 @@ cat > "$TMP_DIR/meta/BACKUP_INFO.txt" <<INFO
 Backup Timestamp : $TIMESTAMP
 Hostname         : $(hostname)
 Backup Type      : SMART (DB + Config + Addons)
-Script Version   : 2.1.1-smart
+Script Version   : 2.2.0-smart
 
 Included:
   databases/nextcloud.sql        — MariaDB logical dump
@@ -1686,6 +1694,12 @@ print_summary() {
     echo -e "  ${C_CYAN}💾 Storage${C_RESET}"
     echo -e "     User Data  → $DATA_BASE"
     echo -e "     App/DB/Cfg → $APP_BASE"
+    echo ""
+    echo -e "  ${C_CYAN}🔄 Shared Folder (Nextcloud ↔ Immich)${C_RESET}"
+    echo -e "     Folder NC  : $SHARED_PHOTOS_DIR"
+    echo -e "     Di Immich  : $SHARED_PHOTOS_MOUNT (read-only)"
+    echo -e "     ${C_YELLOW}⚠ Aktifkan di:${C_RESET} Immich UI → Administration → External Libraries"
+    echo -e "       - Import path: ${C_GREEN}$SHARED_PHOTOS_MOUNT${C_RESET}"
     echo ""
     echo -e "  ${C_CYAN}🔐 Credentials${C_RESET}"
     echo -e "     User     : admin"
