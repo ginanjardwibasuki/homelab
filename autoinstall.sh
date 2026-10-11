@@ -1,14 +1,14 @@
 #!/bin/bash
 # ==============================================================================
 # HOMELAB STACK INSTALLER — ENTERPRISE EDITION
-# Version: 2.1.7-enterprise (clean data/admin skeleton + FQDN email + arithmetic fix)
+# Version: 2.1.1-enterprise (inline password + stale config cleanup)
 # ==============================================================================
 set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="2.1.7-enterprise"
+readonly SCRIPT_VERSION="2.1.1-enterprise"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/homelab-installer.log"
 
@@ -22,15 +22,6 @@ readonly CONFIG_DIR="/root/config"
 readonly CONFIG_FILE="$CONFIG_DIR/homelab.conf"
 readonly LOCK_FILE="/var/lock/homelab-backup.lock"
 readonly UTIL_DIR="/usr/local/bin"
-
-readonly SHARED_PHOTOS_DIR="$DATA_BASE/nextcloud/data/admin/files/Photos"
-readonly SHARED_PHOTOS_MOUNT="/mnt/nc-photos"
-
-# Email admin — WAJIB FQDN valid (Nextcloud 35+ reject domain tanpa dot)
-readonly NC_ADMIN_EMAIL="admin@homelab.local"
-
-# FIX v2.1.7: Marker username untuk deteksi skeleton
-readonly NC_SKELETON_USER="admin"
 
 readonly MIN_DISK_GB=5
 readonly NC_READY_TIMEOUT=300
@@ -144,13 +135,6 @@ prompt_yes_no() {
         read -rp "$prompt [y/N]: " ans
         [[ "$ans" =~ ^[Yy]$ ]]
     fi
-}
-
-# ── FIX v2.1.6: safe integer parse ──
-safe_int() {
-    local v="${1:-0}"
-    v="${v//[^0-9]/}"
-    echo "${v:-0}"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -394,7 +378,7 @@ do_reset() {
 
     log_info "Hapus direktori data..."
     rm -rf "$APP_BASE" "$DATA_BASE" "$CONFIG_DIR" "$RESTORE_DIR"
-    rm -rf /tmp/homelab_* /tmp/nc_manual_install.log /tmp/nc_photos_backup_* 2>/dev/null || true
+    rm -rf /tmp/homelab_* 2>/dev/null || true
 
     log_ok "Reset selesai."
 }
@@ -561,9 +545,12 @@ phase_provision() {
 write_compose() {
     mkdir -p "$COMPOSE_DIR"
 
+    # ── Escape password untuk YAML double-quoted string ──
+    # Rule: \ → \\, " → \", $ → $$ (untuk Docker Compose interpolation)
     local pw_escaped
     pw_escaped=$(printf '%s' "$INPUT_PASSWORD" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\$/$$/g')
 
+    # ⚠️  PENTING: indentasi YAML WAJIB pakai SPASI, bukan TAB.
     cat > "$COMPOSE_FILE" <<EOF
 name: homelab-stack
 
@@ -588,7 +575,6 @@ services:
       MYSQL_PASSWORD: "${pw_escaped}"
       NEXTCLOUD_ADMIN_USER: admin
       NEXTCLOUD_ADMIN_PASSWORD: "${pw_escaped}"
-      NEXTCLOUD_ADMIN_EMAIL: "${NC_ADMIN_EMAIL}"
       NEXTCLOUD_TRUSTED_DOMAINS: "localhost nextcloud 40.40.40.1 192.168.1.0/24"
       REDIS_HOST: nextcloud-redis
       REDIS_HOST_PORT: 6379
@@ -656,7 +642,6 @@ services:
     volumes:
       - /mnt/external_ssd/homelab_data/immich/library:/usr/src/app/upload/library
       - /etc/localtime:/etc/localtime:ro
-      - /mnt/external_ssd/homelab_data/nextcloud/data/admin/files/Photos:/mnt/nc-photos:ro
     depends_on:
       immich-redis:
         condition: service_started
@@ -700,8 +685,10 @@ services:
       - /mnt/external_ssd/homelab_data/jellyfin/media:/media
 EOF
 
+    # Sanity check: TAB
     if grep -qP '\t' "$COMPOSE_FILE" 2>/dev/null; then
         log_err "File $COMPOSE_FILE mengandung TAB — YAML tidak mengizinkan!"
+        log_err "Baris bermasalah:"
         grep -nP '\t' "$COMPOSE_FILE" | head -5 | sed 's/^/    /'
         return 1
     fi
@@ -735,6 +722,7 @@ cleanup_stale() {
     done
 }
 
+# ── FIX v2.1.1: Bersihkan config.php stale kalau DB kosong ──
 cleanup_stale_nc_config() {
     local nc_config="$APP_BASE/nextcloud/app/config/config.php"
 
@@ -744,6 +732,7 @@ cleanup_stale_nc_config() {
 
     log_warn "config.php lama terdeteksi — cek apakah DB punya schema..."
 
+    # Cek apakah DB sudah punya tabel Nextcloud (oc_*)
     local db_has_schema=0
     if docker ps --format '{{.Names}}' | grep -qx "nextcloud_db"; then
         if docker exec nextcloud_db mariadb -u nextcloud -p"$INPUT_PASSWORD" \
@@ -764,159 +753,22 @@ cleanup_stale_nc_config() {
     fi
 }
 
-# ── FIX v2.1.6: Force-clean config dir kalau NC belum installed OR config.php kosong ──
-force_clean_nc_config_dir() {
-    local nc_config_dir="$APP_BASE/nextcloud/app/config"
-    local nc_config_file="$nc_config_dir/config.php"
-
-    if [[ ! -d "$nc_config_dir" ]]; then
-        return 0
-    fi
-
-    local need_clean=0
-    local reason=""
-
-    if [[ ! -f "$nc_config_file" ]]; then
-        need_clean=1
-        reason="config.php tidak ada"
-    elif [[ ! -s "$nc_config_file" ]]; then
-        need_clean=1
-        reason="config.php 0 byte (kosong)"
-    elif ! grep -qE "'installed'[[:space:]]*=>[[:space:]]*true" "$nc_config_file" 2>/dev/null; then
-        need_clean=1
-        reason="config.php tidak punya installed:true"
-    fi
-
-    if (( need_clean == 1 )); then
-        log_warn "config/ perlu dibersihkan ($reason)"
-        rm -f "$nc_config_file"
-        rm -f "$nc_config_dir/CAN_INSTALL"
-        rm -f "$nc_config_dir/autoconfig.php"
-        rm -f "$nc_config_dir/config.php.bak" 2>/dev/null || true
-        log_ok "  Config dir dibersihkan."
-    else
-        log_ok "  config.php sudah installed:true — biarkan."
-    fi
-}
-
-# ── FIX v2.1.6: Reset DB kalau schema ≠ installed flag (fix arithmetic) ──
-force_clean_nc_db_if_needed() {
-    local nc_config_file="$APP_BASE/nextcloud/app/config/config.php"
-
-    if [[ -f "$nc_config_file" ]] && \
-       grep -qE "'installed'[[:space:]]*=>[[:space:]]*true" "$nc_config_file" 2>/dev/null; then
-        return 0
-    fi
-
-    if ! docker ps --format '{{.Names}}' | grep -qx "nextcloud_db"; then
-        return 0
-    fi
-
-    local raw
-    raw=$(docker exec nextcloud_db mariadb -u root -p"$INPUT_PASSWORD" \
-        -e "USE nextcloud; SHOW TABLES LIKE 'oc_%';" 2>/dev/null \
-        | grep -c '^oc_' 2>/dev/null || true)
-    local tables
-    tables=$(safe_int "$raw")
-
-    if (( tables > 0 )); then
-        log_warn "DB Nextcloud punya $tables tabel tapi NC belum installed — reset DB."
-        docker exec nextcloud_db mariadb -u root -p"$INPUT_PASSWORD" -e "
-            DROP DATABASE IF EXISTS nextcloud;
-            CREATE DATABASE nextcloud
-                CHARACTER SET utf8mb4
-                COLLATE utf8mb4_general_ci;
-            CREATE USER IF NOT EXISTS 'nextcloud'@'%' IDENTIFIED BY '$INPUT_PASSWORD';
-            GRANT ALL ON nextcloud.* TO 'nextcloud'@'%';
-            FLUSH PRIVILEGES;
-        " 2>/dev/null || log_warn "  Warning saat reset DB"
-        log_ok "  DB di-reset."
-    fi
-}
-
-# ── FIX v2.1.7: Bersihkan data/admin/ skeleton (penyebab "Login is invalid because files already exist") ──
-force_clean_nc_data_skeleton() {
-    local data_dir="$DATA_BASE/nextcloud/data"
-    local admin_dir="$data_dir/$NC_SKELETON_USER"
-
-    # Kalau NC sudah installed → jangan sentuh
-    local nc_config_file="$APP_BASE/nextcloud/app/config/config.php"
-    if [[ -f "$nc_config_file" ]] && \
-       grep -qE "'installed'[[:space:]]*=>[[:space:]]*true" "$nc_config_file" 2>/dev/null; then
-        return 0
-    fi
-
-    if [[ ! -d "$admin_dir" ]]; then
-        return 0
-    fi
-
-    log_warn "Folder $admin_dir terdeteksi (sisa install gagal) — cek data user..."
-
-    # Cek apakah ada data user (selain skeleton Nextcloud default)
-    local user_files=0
-    if [[ -d "$admin_dir/files" ]]; then
-        user_files=$(find "$admin_dir/files" -mindepth 1 -maxdepth 1 \
-            ! -name 'Documents' \
-            ! -name 'Photos' \
-            ! -name 'Templates' \
-            ! -name 'Nextcloud.png' \
-            ! -name 'Readme.md' \
-            ! -name 'Nextcloud manual.pdf' \
-            2>/dev/null | wc -l)
-        user_files=$(safe_int "$user_files")
-    fi
-
-    # Kalau ada data user → stop, minta manual
-    if (( user_files > 0 )); then
-        log_err "  Data user terdeteksi di $admin_dir/files/ ($user_files item)"
-        log_err "  TIDAK dihapus otomatis. Reset manual kalau mau install ulang:"
-        log_err "    rm -rf $admin_dir"
-        return 1
-    fi
-
-    # Preserve folder Photos (shared NC↔Immich) kalau ada isinya
-    local photos_dir="$admin_dir/files/Photos"
-    local photos_backup="/tmp/nc_photos_backup_$$"
-    local has_photos=0
-
-    if [[ -d "$photos_dir" ]] && [[ -n "$(ls -A "$photos_dir" 2>/dev/null)" ]]; then
-        has_photos=1
-        mkdir -p "$photos_backup"
-        cp -a "$photos_dir/." "$photos_backup/" 2>/dev/null || true
-        log_info "  Folder Photos di-backup sementara ($(du -sh "$photos_backup" 2>/dev/null | cut -f1))"
-    fi
-
-    log_warn "  Hapus data skeleton admin (fresh install)..."
-    rm -rf "$admin_dir" 2>/dev/null || true
-    rm -rf "$data_dir"/appdata_* 2>/dev/null || true
-    rm -f  "$data_dir"/.ocdata 2>/dev/null || true
-    rm -f  "$data_dir"/nextcloud.log 2>/dev/null || true
-    rm -f  "$data_dir"/update.log 2>/dev/null || true
-
-    # Restore Photos kalau ada backup
-    if (( has_photos )); then
-        mkdir -p "$photos_dir"
-        cp -a "$photos_backup/." "$photos_dir/" 2>/dev/null || true
-        chown -R 33:33 "$photos_dir" 2>/dev/null || true
-        rm -rf "$photos_backup"
-        log_ok "  Folder Photos direstorasi."
-    fi
-
-    log_ok "  Data skeleton dibersihkan."
-    return 0
-}
-
 phase_deploy() {
     log_step "PHASE 4: Deploy containers"
 
     write_compose
     validate_compose
 
+    # FIX v2.1.1: Bersihkan config.php stale SEBELUM cleanup_stale
+    # (tapi butuh DB running untuk cek schema, jadi urutannya:
+    #  1. Jangan down dulu — cek DB existing
+    #  2. Kalau DB kosong, hapus config.php
+    #  3. Baru deploy)
     cleanup_stale_nc_config
-    force_clean_nc_config_dir
-    cleanup_stale
-    force_clean_nc_data_skeleton
 
+    cleanup_stale
+
+    # ── Cek volume DB Nextcloud, reset kalau rusak ──
     local nc_db_dir="$APP_BASE/nextcloud/db"
     if [[ -d "$nc_db_dir/mysql" ]] && [[ ! -f "$nc_db_dir/mysql/ibdata1" ]]; then
         log_warn "Volume DB Nextcloud tidak lengkap (ibdata1 hilang) — dibersihkan."
@@ -944,106 +796,15 @@ phase_deploy() {
         return 1
     fi
 
-    force_clean_nc_db_if_needed
-
     log_ok "Semua container running."
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PHASE 5: WAIT READY
 # ══════════════════════════════════════════════════════════════════════════════
-
 nc_is_installed() {
-    if docker exec nextcloud grep -qE "'installed'[[:space:]]*=>[[:space:]]*true" \
-            /var/www/html/config/config.php 2>/dev/null; then
-        return 0
-    fi
-
-    if docker exec --user www-data nextcloud php occ status 2>/dev/null \
-            | grep -q "installed: true"; then
-        return 0
-    fi
-
-    if docker exec nextcloud php occ status 2>/dev/null \
-            | grep -q "installed: true"; then
-        return 0
-    fi
-
-    if docker exec nextcloud php -r \
-            'echo @file_get_contents("http://localhost/status.php") ?: "";' 2>/dev/null \
-            | grep -q '"installed":true'; then
-        return 0
-    fi
-
-    return 1
-}
-
-_nc_dump_diagnostics() {
-    local label="${1:-DIAGNOSA}"
-    echo ""
-    echo -e "${C_YELLOW}═══ ${label} ═══${C_RESET}"
-    echo ""
-    echo -e "${C_YELLOW}── occ status (as www-data) ──${C_RESET}"
-    docker exec --user www-data nextcloud php occ status 2>&1 | head -15 | sed 's/^/    /' || true
-    echo ""
-    echo -e "${C_YELLOW}── config/ dir contents ──${C_RESET}"
-    docker exec nextcloud ls -la /var/www/html/config/ 2>&1 | sed 's/^/    /' || true
-    echo ""
-    echo -e "${C_YELLOW}── config.php content (key lines) ──${C_RESET}"
-    docker exec nextcloud grep -E "dbtype|dbname|dbuser|dbhost|installed|version|datadirectory" \
-        /var/www/html/config/config.php 2>&1 \
-        | sed -E "s/(dbpassword.*=>).*/\1***/" \
-        | sed 's/^/    /' || true
-    echo ""
-    echo -e "${C_YELLOW}── Env var (MYSQL/NEXTCLOUD) ──${C_RESET}"
-    docker exec nextcloud env 2>/dev/null \
-        | grep -E '^(NEXTCLOUD_|MYSQL_)' \
-        | sed -E 's/(PASSWORD=).*/\1***/' \
-        | sed 's/^/    /' || true
-    echo ""
-    echo -e "${C_YELLOW}── HTTP status.php (via PHP) ──${C_RESET}"
-    docker exec nextcloud php -r \
-        'echo @file_get_contents("http://localhost/status.php") ?: "(kosong)";' 2>&1 \
-        | sed 's/^/    /' || true
-    echo ""
-    echo -e "${C_YELLOW}── Entrypoint log last 20 ──${C_RESET}"
-    docker logs nextcloud --tail 20 2>&1 | sed 's/^/    /' || true
-    echo ""
-}
-
-# ── Manual install dengan email FQDN valid ──
-nc_manual_install() {
-    log_info "Menjalankan MANUAL install Nextcloud (occ maintenance:install)..."
-    log_info "  Admin: admin / $NC_ADMIN_EMAIL"
-
-    docker exec --user www-data nextcloud sh -c '
-        rm -f /var/www/html/config/CAN_INSTALL
-        rm -f /var/www/html/config/config.php
-        rm -f /var/www/html/config/autoconfig.php
-    ' 2>/dev/null || true
-
-    sleep 2
-
-    local log_file="/tmp/nc_manual_install.log"
-    docker exec --user www-data nextcloud php occ maintenance:install \
-        --database mysql \
-        --database-host nextcloud-db \
-        --database-name nextcloud \
-        --database-user nextcloud \
-        --database-pass "$INPUT_PASSWORD" \
-        --admin-user admin \
-        --admin-pass "$INPUT_PASSWORD" \
-        --admin-email "$NC_ADMIN_EMAIL" > "$log_file" 2>&1
-    local rc=$?
-
-    if (( rc == 0 )); then
-        log_ok "Manual install BERHASIL."
-        return 0
-    fi
-
-    log_err "Manual install GAGAL (exit=$rc). Log:"
-    tail -30 "$log_file" | sed 's/^/    /'
-    return 1
+    docker exec --user www-data nextcloud php occ status 2>/dev/null \
+        | grep -q "installed: true"
 }
 
 phase_wait_ready() {
@@ -1051,34 +812,12 @@ phase_wait_ready() {
 
     local elapsed=0
     local err_pattern='Access denied|SQLSTATE\[|Cannot connect|Connection refused|Error while trying to create admin user|Unhandled exception|Fatal error'
-    local diag_shown=0
-    local manual_install_attempts=0
 
     while (( elapsed < NC_READY_TIMEOUT )); do
         if nc_is_installed; then
             echo ""
-            log_ok "Nextcloud ready. (@${elapsed}s)"
+            log_ok "Nextcloud ready."
             return 0
-        fi
-
-        if (( elapsed == 60 && diag_shown == 0 )); then
-            diag_shown=1
-            log_warn "Belum ready @60s — menjalankan diagnosa..."
-            _nc_dump_diagnostics "DIAGNOSA @60s"
-        fi
-
-        # Manual install attempt #1 @30s
-        if (( elapsed >= 30 && manual_install_attempts == 0 )); then
-            manual_install_attempts=1
-            log_warn "Belum ready @${elapsed}s — coba manual install (attempt #1)..."
-            nc_manual_install || true
-        fi
-
-        # Manual install attempt #2 @150s
-        if (( elapsed >= 150 && manual_install_attempts == 1 )); then
-            manual_install_attempts=2
-            log_warn "Masih belum ready @${elapsed}s — coba manual install (attempt #2)..."
-            nc_manual_install || true
         fi
 
         if docker logs nextcloud --tail 100 2>&1 | grep -qiE "$err_pattern"; then
@@ -1087,6 +826,14 @@ phase_wait_ready() {
             echo ""
             echo -e "${C_YELLOW}── Error yang terdeteksi ──${C_RESET}"
             docker logs nextcloud --tail 100 2>&1 | grep -iE "$err_pattern" | head -5 | sed 's/^/    /' || true
+            echo ""
+            echo -e "${C_YELLOW}── Diagnostik ──${C_RESET}"
+            echo "    1. Cek apakah DB bisa di-ping dari container NC:"
+            echo "       docker exec nextcloud getent hosts nextcloud-db"
+            echo "    2. Cek env var yang masuk ke container:"
+            echo "       docker exec nextcloud env | grep MYSQL"
+            echo "    3. Cek koneksi manual ke DB:"
+            echo "       docker exec nextcloud bash -c 'mysql -h nextcloud-db -u nextcloud -p\"\$MYSQL_PASSWORD\" -e \"SELECT 1;\"'"
             echo ""
             echo -e "${C_YELLOW}── Solusi ──${C_RESET}"
             echo "    $SCRIPT_NAME --reset"
@@ -1105,16 +852,10 @@ phase_wait_ready() {
 
     echo ""
     log_err "TIMEOUT setelah ${NC_READY_TIMEOUT}s."
-
-    _nc_dump_diagnostics "DIAGNOSA FINAL"
-
-    if [[ -f /tmp/nc_manual_install.log ]]; then
-        echo -e "${C_YELLOW}── Manual install log (30 terakhir) ──${C_RESET}"
-        tail -30 /tmp/nc_manual_install.log | sed 's/^/    /' || true
-        echo ""
-    fi
-
-    log_info "Coba akses manual: http://${SERVER_IP}:8080"
+    echo "── Log Nextcloud (50 terakhir) ──"
+    docker logs nextcloud --tail 50 2>&1 | sed 's/^/    /' || true
+    echo "── Log DB (30 terakhir) ──"
+    docker logs nextcloud_db --tail 30 2>&1 | sed 's/^/    /' || true
     return 1
 }
 
@@ -1150,17 +891,6 @@ phase_tuning() {
         fi
     ' 2>/dev/null || true
     docker exec --user root nextcloud a2enmod headers 2>/dev/null || true
-
-    log_info "Setup shared folder Nextcloud ↔ Immich..."
-    if [[ -d "$SHARED_PHOTOS_DIR" ]]; then
-        log_info "  Folder sudah ada, update permission saja."
-    else
-        mkdir -p "$SHARED_PHOTOS_DIR"
-    fi
-    chown -R 33:33 "$SHARED_PHOTOS_DIR" 2>/dev/null || true
-    chmod -R u=rwX,g=rX,o=rX "$SHARED_PHOTOS_DIR" 2>/dev/null || true
-    docker exec --user www-data nextcloud php occ files:scan admin 2>/dev/null || true
-    log_ok "  Shared folder siap: $SHARED_PHOTOS_DIR"
 
     log_info "Restart Nextcloud..."
     docker restart nextcloud >/dev/null
@@ -1347,7 +1077,7 @@ cat > "$TMP_DIR/meta/BACKUP_INFO.txt" <<INFO
 Backup Timestamp : $TIMESTAMP
 Hostname         : $(hostname)
 Backup Type      : SMART (DB + Config + Addons)
-Script Version   : 2.1.7-smart
+Script Version   : 2.1.1-smart
 
 Included:
   databases/nextcloud.sql        — MariaDB logical dump
@@ -1569,6 +1299,7 @@ ok "Backup: $LATEST (${SIZE_H}) — tipe: ${BACKUP_TYPE}"
 
 if [[ "$BACKUP_TYPE" != "smart" ]]; then
     warn "Backup ini bukan format 'smart' (v2.1+)."
+    warn "Format lama perlu restore manual. Coba 'autorestore' versi lama."
     exit 1
 fi
 
@@ -1709,8 +1440,7 @@ STACK_STOPPED=0
 log "     Tunggu Nextcloud ready (maks 180s)..."
 NC_READY=0
 for _ in $(seq 1 60); do
-    if docker exec --user www-data nextcloud php occ status 2>/dev/null | grep -q "installed: true" \
-    || docker exec nextcloud grep -qE "'installed'[[:space:]]*=>[[:space:]]*true" /var/www/html/config/config.php 2>/dev/null; then
+    if docker exec --user www-data nextcloud php occ status 2>/dev/null | grep -q "installed: true"; then
         NC_READY=1
         break
     fi
@@ -1924,7 +1654,7 @@ phase_healthcheck() {
         fi
     done
 
-    if nc_is_installed; then
+    if docker exec --user www-data nextcloud php occ status 2>/dev/null | grep -q "installed: true"; then
         log_ok "  Nextcloud: installed"
     else
         log_warn "  Nextcloud: belum terinstall"
@@ -1957,16 +1687,8 @@ print_summary() {
     echo -e "     User Data  → $DATA_BASE"
     echo -e "     App/DB/Cfg → $APP_BASE"
     echo ""
-    echo -e "  ${C_CYAN}🔄 Shared Folder (Nextcloud ↔ Immich)${C_RESET}"
-    echo -e "     Folder NC  : $SHARED_PHOTOS_DIR"
-    echo -e "     Di Immich  : $SHARED_PHOTOS_MOUNT (read-only)"
-    echo -e "     ${C_YELLOW}⚠ Aktifkan di:${C_RESET} Immich UI → Administration → External Libraries"
-    echo -e "       - Import path: ${C_GREEN}$SHARED_PHOTOS_MOUNT${C_RESET}"
-    echo -e "       - Owner: admin (Immich user)"
-    echo ""
     echo -e "  ${C_CYAN}🔐 Credentials${C_RESET}"
     echo -e "     User     : admin"
-    echo -e "     Email    : $NC_ADMIN_EMAIL"
     echo -e "     Password : (lihat $CONFIG_FILE)"
     echo ""
     echo -e "  ${C_CYAN}🛠️  Utilities${C_RESET}"
