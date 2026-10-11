@@ -1,14 +1,14 @@
 #!/bin/bash
 # ==============================================================================
 # HOMELAB STACK INSTALLER — ENTERPRISE EDITION
-# Version: 2.1.4-enterprise (manual install fallback + force-clean config dir)
+# Version: 2.1.5-enterprise (aggressive manual install + clean slate + PHP-based checks)
 # ==============================================================================
 set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="2.1.4-enterprise"
+readonly SCRIPT_VERSION="2.1.5-enterprise"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/homelab-installer.log"
 
@@ -382,7 +382,7 @@ do_reset() {
 
     log_info "Hapus direktori data..."
     rm -rf "$APP_BASE" "$DATA_BASE" "$CONFIG_DIR" "$RESTORE_DIR"
-    rm -rf /tmp/homelab_* 2>/dev/null || true
+    rm -rf /tmp/homelab_* /tmp/nc_manual_install.log 2>/dev/null || true
 
     log_ok "Reset selesai."
 }
@@ -540,9 +540,6 @@ phase_provision() {
     chown -R 999:999   "$APP_BASE/immich/postgres"   2>/dev/null || true
     chmod -R 700       "$APP_BASE/immich/postgres"   2>/dev/null || true
 
-    # ⚠️  Folder $SHARED_PHOTOS_DIR dibuat di phase_tuning()
-    #     (setelah Nextcloud init skeleton admin/files) agar tidak bentrok.
-
     log_ok "Layout:"
     echo -e "    ${C_GREY}SSD:${C_RESET}      $DATA_BASE"
     echo -e "    ${C_GREY}Local:${C_RESET}    $APP_BASE"
@@ -556,7 +553,6 @@ write_compose() {
     mkdir -p "$COMPOSE_DIR"
 
     # ── Escape password untuk YAML double-quoted string ──
-    # Rule: \ → \\, " → \", $ → $$ (untuk Docker Compose interpolation)
     local pw_escaped
     pw_escaped=$(printf '%s' "$INPUT_PASSWORD" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\$/$$/g')
 
@@ -585,6 +581,7 @@ services:
       MYSQL_PASSWORD: "${pw_escaped}"
       NEXTCLOUD_ADMIN_USER: admin
       NEXTCLOUD_ADMIN_PASSWORD: "${pw_escaped}"
+      NEXTCLOUD_ADMIN_EMAIL: "admin@localhost"
       NEXTCLOUD_TRUSTED_DOMAINS: "localhost nextcloud 40.40.40.1 192.168.1.0/24"
       REDIS_HOST: nextcloud-redis
       REDIS_HOST_PORT: 6379
@@ -696,10 +693,8 @@ services:
       - /mnt/external_ssd/homelab_data/jellyfin/media:/media
 EOF
 
-    # Sanity check: TAB
     if grep -qP '\t' "$COMPOSE_FILE" 2>/dev/null; then
         log_err "File $COMPOSE_FILE mengandung TAB — YAML tidak mengizinkan!"
-        log_err "Baris bermasalah:"
         grep -nP '\t' "$COMPOSE_FILE" | head -5 | sed 's/^/    /'
         return 1
     fi
@@ -733,7 +728,6 @@ cleanup_stale() {
     done
 }
 
-# ── FIX v2.1.1: Bersihkan config.php stale kalau DB kosong ──
 cleanup_stale_nc_config() {
     local nc_config="$APP_BASE/nextcloud/app/config/config.php"
 
@@ -743,7 +737,6 @@ cleanup_stale_nc_config() {
 
     log_warn "config.php lama terdeteksi — cek apakah DB punya schema..."
 
-    # Cek apakah DB sudah punya tabel Nextcloud (oc_*)
     local db_has_schema=0
     if docker ps --format '{{.Names}}' | grep -qx "nextcloud_db"; then
         if docker exec nextcloud_db mariadb -u nextcloud -p"$INPUT_PASSWORD" \
@@ -764,8 +757,7 @@ cleanup_stale_nc_config() {
     fi
 }
 
-# ── FIX v2.1.4: Force-clean config/ dir kalau NC belum installed ──
-# Penyebab: entrypoint nextcloud SKIP auto-install kalau ada file apapun di config/
+# ── FIX v2.1.5: Force-clean config/ dir + DB reset kalau NC belum installed ──
 force_clean_nc_config_dir() {
     local nc_config_dir="$APP_BASE/nextcloud/app/config"
     local nc_config_file="$nc_config_dir/config.php"
@@ -774,21 +766,57 @@ force_clean_nc_config_dir() {
         return 0
     fi
 
-    # Kalau config.php tidak ada ATAU tidak punya installed=>true → force clean
-    if [[ ! -f "$nc_config_file" ]] || \
-       ! grep -qE "'installed'\s*=>\s*true" "$nc_config_file" 2>/dev/null; then
+    local need_clean=0
+    if [[ ! -f "$nc_config_file" ]]; then
+        need_clean=1
+    elif ! grep -qE "'installed'[[:space:]]*=>[[:space:]]*true" "$nc_config_file" 2>/dev/null; then
+        need_clean=1
+    fi
 
-        log_warn "config/ ada tapi NC belum installed — force clean sebelum deploy"
+    if (( need_clean == 1 )); then
+        log_warn "config/ ada tapi NC belum installed — force clean (config.php + CAN_INSTALL + autoconfig)"
         rm -f "$nc_config_file"
         rm -f "$nc_config_dir/CAN_INSTALL"
+        rm -f "$nc_config_dir/autoconfig.php"
         rm -f "$nc_config_dir/config.php.bak" 2>/dev/null || true
-        # Hapus file sampah lain kecuali .htaccess (dari image)
-        find "$nc_config_dir" -maxdepth 1 -type f \
-            ! -name '.htaccess' ! -name 'config.php' 2>/dev/null \
-            -delete 2>/dev/null || true
         log_ok "  Config dir dibersihkan."
     else
         log_ok "  config.php sudah installed:true — biarkan."
+    fi
+}
+
+# ── FIX v2.1.5: Reset DB Nextcloud kalau NC belum installed (schema kosong) ──
+force_clean_nc_db_if_needed() {
+    # Kalau config.php tidak installed:true → DB harus di-reset juga
+    # (mencegah: DB sudah punya oc_* tapi config.php installed:false → bentrok)
+    local nc_config_file="$APP_BASE/nextcloud/app/config/config.php"
+
+    if [[ -f "$nc_config_file" ]] && \
+       grep -qE "'installed'[[:space:]]*=>[[:space:]]*true" "$nc_config_file" 2>/dev/null; then
+        return 0  # NC installed, biarkan DB
+    fi
+
+    # Start DB temporary untuk cek schema
+    if ! docker ps --format '{{.Names}}' | grep -qx "nextcloud_db"; then
+        return 0  # DB belum running, tidak perlu reset
+    fi
+
+    local tables
+    tables=$(docker exec nextcloud_db mariadb -u root -p"$INPUT_PASSWORD" \
+        -e "USE nextcloud; SHOW TABLES LIKE 'oc_%';" 2>/dev/null | grep -c '^oc_' || echo "0")
+
+    if (( tables > 0 )); then
+        log_warn "DB Nextcloud punya $tables tabel tapi NC belum installed — reset DB."
+        docker exec nextcloud_db mariadb -u root -p"$INPUT_PASSWORD" -e "
+            DROP DATABASE IF EXISTS nextcloud;
+            CREATE DATABASE nextcloud
+                CHARACTER SET utf8mb4
+                COLLATE utf8mb4_general_ci;
+            CREATE USER IF NOT EXISTS 'nextcloud'@'%' IDENTIFIED BY '$INPUT_PASSWORD';
+            GRANT ALL ON nextcloud.* TO 'nextcloud'@'%';
+            FLUSH PRIVILEGES;
+        " 2>/dev/null || log_warn "  Warning saat reset DB"
+        log_ok "  DB di-reset."
     fi
 }
 
@@ -830,6 +858,9 @@ phase_deploy() {
         return 1
     fi
 
+    # Reset DB NC kalau schema ada tapi NC belum installed
+    force_clean_nc_db_if_needed
+
     log_ok "Semua container running."
 }
 
@@ -837,28 +868,29 @@ phase_deploy() {
 # PHASE 5: WAIT READY
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── FIX v2.1.3: Multi-method NC detection (robust untuk PHP 8.5+) ──
+# ── Multi-method NC detection ──
 nc_is_installed() {
-    # Method 1: occ status as www-data (primary)
+    # Method 1: config.php installed:true (anti-PHP-bug, paling reliable)
+    if docker exec nextcloud grep -qE "'installed'[[:space:]]*=>[[:space:]]*true" \
+            /var/www/html/config/config.php 2>/dev/null; then
+        return 0
+    fi
+
+    # Method 2: occ status as www-data
     if docker exec --user www-data nextcloud php occ status 2>/dev/null \
             | grep -q "installed: true"; then
         return 0
     fi
 
-    # Method 2: occ status as root (fallback permission/PHP bug)
+    # Method 3: occ status as root
     if docker exec nextcloud php occ status 2>/dev/null \
             | grep -q "installed: true"; then
         return 0
     fi
 
-    # Method 3: baca config.php langsung (anti-PHP-bug)
-    if docker exec nextcloud grep -qE "'installed'\s*=>\s*true" \
-            /var/www/html/config/config.php 2>/dev/null; then
-        return 0
-    fi
-
-    # Method 4: HTTP /status.php (paling reliable kalau occ broken)
-    if docker exec nextcloud curl -sf --max-time 5 http://localhost/status.php 2>/dev/null \
+    # Method 4: HTTP status.php via PHP (hindari curl dependency)
+    if docker exec nextcloud php -r \
+            'echo @file_get_contents("http://localhost/status.php") ?: "";' 2>/dev/null \
             | grep -q '"installed":true'; then
         return 0
     fi
@@ -874,15 +906,14 @@ _nc_dump_diagnostics() {
     echo -e "${C_YELLOW}── occ status (as www-data) ──${C_RESET}"
     docker exec --user www-data nextcloud php occ status 2>&1 | head -15 | sed 's/^/    /' || true
     echo ""
-    echo -e "${C_YELLOW}── occ status (as root) ──${C_RESET}"
-    docker exec nextcloud php occ status 2>&1 | head -15 | sed 's/^/    /' || true
-    echo ""
     echo -e "${C_YELLOW}── config/ dir contents ──${C_RESET}"
     docker exec nextcloud ls -la /var/www/html/config/ 2>&1 | sed 's/^/    /' || true
     echo ""
-    echo -e "${C_YELLOW}── config.php installed flag ──${C_RESET}"
-    docker exec nextcloud grep -E "'installed'" \
-        /var/www/html/config/config.php 2>&1 | sed 's/^/    /' || true
+    echo -e "${C_YELLOW}── config.php content (key lines) ──${C_RESET}"
+    docker exec nextcloud grep -E "dbtype|dbname|dbuser|dbhost|installed|version|datadirectory" \
+        /var/www/html/config/config.php 2>&1 \
+        | sed -E "s/(dbpassword.*=>).*/\1***/" \
+        | sed 's/^/    /' || true
     echo ""
     echo -e "${C_YELLOW}── Env var (MYSQL/NEXTCLOUD) ──${C_RESET}"
     docker exec nextcloud env 2>/dev/null \
@@ -890,17 +921,26 @@ _nc_dump_diagnostics() {
         | sed -E 's/(PASSWORD=).*/\1***/' \
         | sed 's/^/    /' || true
     echo ""
-    echo -e "${C_YELLOW}── HTTP status.php ──${C_RESET}"
-    docker exec nextcloud curl -s --max-time 5 http://localhost/status.php 2>&1 | sed 's/^/    /' || true
+    echo -e "${C_YELLOW}── HTTP status.php (via PHP) ──${C_RESET}"
+    docker exec nextcloud php -r \
+        'echo @file_get_contents("http://localhost/status.php") ?: "(kosong)";' 2>&1 \
+        | sed 's/^/    /' || true
+    echo ""
+    echo -e "${C_YELLOW}── Proses di container (head) ──${C_RESET}"
+    docker exec nextcloud ps aux 2>/dev/null | head -10 | sed 's/^/    /' || true
     echo ""
 }
 
-# ── FIX v2.1.4: Manual install fallback ──
+# ── Manual install (aggressive, clean slate) ──
 nc_manual_install() {
     log_info "Menjalankan MANUAL install Nextcloud (occ maintenance:install)..."
 
-    # Beri kesempatan entrypoint NC selesai dulu
-    sleep 3
+    # Hapus CAN_INSTALL + config.php — occ butuh config.php tidak ada atau installed:false
+    docker exec --user www-data nextcloud rm -f /var/www/html/config/CAN_INSTALL 2>/dev/null || true
+    docker exec --user www-data nextcloud rm -f /var/www/html/config/config.php 2>/dev/null || true
+    docker exec --user www-data nextcloud rm -f /var/www/html/config/autoconfig.php 2>/dev/null || true
+
+    sleep 2
 
     local log_file="/tmp/nc_manual_install.log"
     docker exec --user www-data nextcloud php occ maintenance:install \
@@ -930,7 +970,7 @@ phase_wait_ready() {
     local elapsed=0
     local err_pattern='Access denied|SQLSTATE\[|Cannot connect|Connection refused|Error while trying to create admin user|Unhandled exception|Fatal error'
     local diag_shown=0
-    local manual_install_tried=0
+    local manual_install_attempts=0
 
     while (( elapsed < NC_READY_TIMEOUT )); do
         if nc_is_installed; then
@@ -946,24 +986,21 @@ phase_wait_ready() {
             _nc_dump_diagnostics "DIAGNOSA @60s"
         fi
 
-        # ── FIX v2.1.4: Manual install fallback @90s kalau entrypoint skip ──
-        if (( elapsed >= 90 && manual_install_tried == 0 )); then
-            manual_install_tried=1
-
-            # Cek apakah Apache sudah running (entrypoint selesai)
-            if docker exec nextcloud curl -sf --max-time 5 http://localhost/status.php >/dev/null 2>&1; then
-                log_warn "Entrypoint NC selesai tapi installed:false — coba manual install..."
-                if nc_manual_install; then
-                    sleep 5
-                    # Loop akan cek nc_is_installed di iterasi berikutnya
-                else
-                    log_err "Manual install gagal — akan tetap polling sampai timeout."
-                fi
-            else
-                log_info "Apache belum running — tunggu entrypoint selesai dulu."
-            fi
+        # ── FIX v2.1.5: Manual install @30s dan retry @150s ──
+        # occ maintenance:install TIDAK butuh Apache running
+        if (( elapsed >= 30 && manual_install_attempts == 0 )); then
+            manual_install_attempts=1
+            log_warn "Belum ready @${elapsed}s — coba manual install (attempt #1)..."
+            nc_manual_install || true
         fi
 
+        if (( elapsed >= 150 && manual_install_attempts == 1 )); then
+            manual_install_attempts=2
+            log_warn "Masih belum ready @${elapsed}s — coba manual install (attempt #2)..."
+            nc_manual_install || true
+        fi
+
+        # ── Deteksi error fatal dari log ──
         if docker logs nextcloud --tail 100 2>&1 | grep -qiE "$err_pattern"; then
             echo ""
             log_err "FATAL: Nextcloud tidak bisa init (error terdeteksi di log)."
@@ -974,9 +1011,7 @@ phase_wait_ready() {
             echo -e "${C_YELLOW}── Diagnostik ──${C_RESET}"
             echo "    1. Cek apakah DB bisa di-ping dari container NC:"
             echo "       docker exec nextcloud getent hosts nextcloud-db"
-            echo "    2. Cek env var yang masuk ke container:"
-            echo "       docker exec nextcloud env | grep MYSQL"
-            echo "    3. Cek koneksi manual ke DB:"
+            echo "    2. Cek koneksi manual ke DB:"
             echo "       docker exec nextcloud bash -c 'mysql -h nextcloud-db -u nextcloud -p\"\$MYSQL_PASSWORD\" -e \"SELECT 1;\"'"
             echo ""
             echo -e "${C_YELLOW}── Solusi ──${C_RESET}"
@@ -999,12 +1034,8 @@ phase_wait_ready() {
 
     _nc_dump_diagnostics "DIAGNOSA FINAL"
 
-    echo -e "${C_YELLOW}── Log Nextcloud (30 terakhir) ──${C_RESET}"
-    docker logs nextcloud --tail 30 2>&1 | sed 's/^/    /' || true
-    echo ""
-
     if [[ -f /tmp/nc_manual_install.log ]]; then
-        echo -e "${C_YELLOW}── Manual install log ──${C_RESET}"
+        echo -e "${C_YELLOW}── Manual install log (30 terakhir) ──${C_RESET}"
         tail -30 /tmp/nc_manual_install.log | sed 's/^/    /' || true
         echo ""
     fi
@@ -1046,23 +1077,15 @@ phase_tuning() {
     ' 2>/dev/null || true
     docker exec --user root nextcloud a2enmod headers 2>/dev/null || true
 
-    # ── FIX v2.1.2: Setup shared folder NC↔Immich SETELAH NC init ──
     log_info "Setup shared folder Nextcloud ↔ Immich..."
-
     if [[ -d "$SHARED_PHOTOS_DIR" ]]; then
         log_info "  Folder sudah ada, update permission saja."
     else
         mkdir -p "$SHARED_PHOTOS_DIR"
     fi
-
-    # Owner: www-data (33:33) — Nextcloud bisa write
-    # Group/other: read+traverse — Immich (uid 1000) bisa baca
     chown -R 33:33 "$SHARED_PHOTOS_DIR" 2>/dev/null || true
     chmod -R u=rwX,g=rX,o=rX "$SHARED_PHOTOS_DIR" 2>/dev/null || true
-
-    # Scan ulang agar Nextcloud tahu folder baru
     docker exec --user www-data nextcloud php occ files:scan admin 2>/dev/null || true
-
     log_ok "  Shared folder siap: $SHARED_PHOTOS_DIR"
 
     log_info "Restart Nextcloud..."
@@ -1250,7 +1273,7 @@ cat > "$TMP_DIR/meta/BACKUP_INFO.txt" <<INFO
 Backup Timestamp : $TIMESTAMP
 Hostname         : $(hostname)
 Backup Type      : SMART (DB + Config + Addons)
-Script Version   : 2.1.4-smart
+Script Version   : 2.1.5-smart
 
 Included:
   databases/nextcloud.sql        — MariaDB logical dump
@@ -1472,7 +1495,6 @@ ok "Backup: $LATEST (${SIZE_H}) — tipe: ${BACKUP_TYPE}"
 
 if [[ "$BACKUP_TYPE" != "smart" ]]; then
     warn "Backup ini bukan format 'smart' (v2.1+)."
-    warn "Format lama perlu restore manual. Coba 'autorestore' versi lama."
     exit 1
 fi
 
@@ -1614,7 +1636,7 @@ log "     Tunggu Nextcloud ready (maks 180s)..."
 NC_READY=0
 for _ in $(seq 1 60); do
     if docker exec --user www-data nextcloud php occ status 2>/dev/null | grep -q "installed: true" \
-    || docker exec nextcloud curl -sf http://localhost/status.php 2>/dev/null | grep -q '"installed":true'; then
+    || docker exec nextcloud grep -qE "'installed'[[:space:]]*=>[[:space:]]*true" /var/www/html/config/config.php 2>/dev/null; then
         NC_READY=1
         break
     fi
