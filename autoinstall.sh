@@ -1,14 +1,14 @@
 #!/bin/bash
 # ==============================================================================
 # HOMELAB STACK INSTALLER — ENTERPRISE EDITION
-# Version: 2.1.6-enterprise (fix email FQDN + arithmetic + empty config.php)
+# Version: 2.1.7-enterprise (clean data/admin skeleton + FQDN email + arithmetic fix)
 # ==============================================================================
 set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="2.1.6-enterprise"
+readonly SCRIPT_VERSION="2.1.7-enterprise"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/homelab-installer.log"
 
@@ -28,6 +28,9 @@ readonly SHARED_PHOTOS_MOUNT="/mnt/nc-photos"
 
 # Email admin — WAJIB FQDN valid (Nextcloud 35+ reject domain tanpa dot)
 readonly NC_ADMIN_EMAIL="admin@homelab.local"
+
+# FIX v2.1.7: Marker username untuk deteksi skeleton
+readonly NC_SKELETON_USER="admin"
 
 readonly MIN_DISK_GB=5
 readonly NC_READY_TIMEOUT=300
@@ -391,7 +394,7 @@ do_reset() {
 
     log_info "Hapus direktori data..."
     rm -rf "$APP_BASE" "$DATA_BASE" "$CONFIG_DIR" "$RESTORE_DIR"
-    rm -rf /tmp/homelab_* /tmp/nc_manual_install.log 2>/dev/null || true
+    rm -rf /tmp/homelab_* /tmp/nc_manual_install.log /tmp/nc_photos_backup_* 2>/dev/null || true
 
     log_ok "Reset selesai."
 }
@@ -777,7 +780,6 @@ force_clean_nc_config_dir() {
         need_clean=1
         reason="config.php tidak ada"
     elif [[ ! -s "$nc_config_file" ]]; then
-        # FIX v2.1.6: config.php 0 byte → penyebab error "not overwriting"
         need_clean=1
         reason="config.php 0 byte (kosong)"
     elif ! grep -qE "'installed'[[:space:]]*=>[[:space:]]*true" "$nc_config_file" 2>/dev/null; then
@@ -832,6 +834,78 @@ force_clean_nc_db_if_needed() {
     fi
 }
 
+# ── FIX v2.1.7: Bersihkan data/admin/ skeleton (penyebab "Login is invalid because files already exist") ──
+force_clean_nc_data_skeleton() {
+    local data_dir="$DATA_BASE/nextcloud/data"
+    local admin_dir="$data_dir/$NC_SKELETON_USER"
+
+    # Kalau NC sudah installed → jangan sentuh
+    local nc_config_file="$APP_BASE/nextcloud/app/config/config.php"
+    if [[ -f "$nc_config_file" ]] && \
+       grep -qE "'installed'[[:space:]]*=>[[:space:]]*true" "$nc_config_file" 2>/dev/null; then
+        return 0
+    fi
+
+    if [[ ! -d "$admin_dir" ]]; then
+        return 0
+    fi
+
+    log_warn "Folder $admin_dir terdeteksi (sisa install gagal) — cek data user..."
+
+    # Cek apakah ada data user (selain skeleton Nextcloud default)
+    local user_files=0
+    if [[ -d "$admin_dir/files" ]]; then
+        user_files=$(find "$admin_dir/files" -mindepth 1 -maxdepth 1 \
+            ! -name 'Documents' \
+            ! -name 'Photos' \
+            ! -name 'Templates' \
+            ! -name 'Nextcloud.png' \
+            ! -name 'Readme.md' \
+            ! -name 'Nextcloud manual.pdf' \
+            2>/dev/null | wc -l)
+        user_files=$(safe_int "$user_files")
+    fi
+
+    # Kalau ada data user → stop, minta manual
+    if (( user_files > 0 )); then
+        log_err "  Data user terdeteksi di $admin_dir/files/ ($user_files item)"
+        log_err "  TIDAK dihapus otomatis. Reset manual kalau mau install ulang:"
+        log_err "    rm -rf $admin_dir"
+        return 1
+    fi
+
+    # Preserve folder Photos (shared NC↔Immich) kalau ada isinya
+    local photos_dir="$admin_dir/files/Photos"
+    local photos_backup="/tmp/nc_photos_backup_$$"
+    local has_photos=0
+
+    if [[ -d "$photos_dir" ]] && [[ -n "$(ls -A "$photos_dir" 2>/dev/null)" ]]; then
+        has_photos=1
+        mkdir -p "$photos_backup"
+        cp -a "$photos_dir/." "$photos_backup/" 2>/dev/null || true
+        log_info "  Folder Photos di-backup sementara ($(du -sh "$photos_backup" 2>/dev/null | cut -f1))"
+    fi
+
+    log_warn "  Hapus data skeleton admin (fresh install)..."
+    rm -rf "$admin_dir" 2>/dev/null || true
+    rm -rf "$data_dir"/appdata_* 2>/dev/null || true
+    rm -f  "$data_dir"/.ocdata 2>/dev/null || true
+    rm -f  "$data_dir"/nextcloud.log 2>/dev/null || true
+    rm -f  "$data_dir"/update.log 2>/dev/null || true
+
+    # Restore Photos kalau ada backup
+    if (( has_photos )); then
+        mkdir -p "$photos_dir"
+        cp -a "$photos_backup/." "$photos_dir/" 2>/dev/null || true
+        chown -R 33:33 "$photos_dir" 2>/dev/null || true
+        rm -rf "$photos_backup"
+        log_ok "  Folder Photos direstorasi."
+    fi
+
+    log_ok "  Data skeleton dibersihkan."
+    return 0
+}
+
 phase_deploy() {
     log_step "PHASE 4: Deploy containers"
 
@@ -841,6 +915,7 @@ phase_deploy() {
     cleanup_stale_nc_config
     force_clean_nc_config_dir
     cleanup_stale
+    force_clean_nc_data_skeleton
 
     local nc_db_dir="$APP_BASE/nextcloud/db"
     if [[ -d "$nc_db_dir/mysql" ]] && [[ ! -f "$nc_db_dir/mysql/ibdata1" ]]; then
@@ -936,12 +1011,11 @@ _nc_dump_diagnostics() {
     echo ""
 }
 
-# ── FIX v2.1.6: Manual install dengan email FQDN valid ──
+# ── Manual install dengan email FQDN valid ──
 nc_manual_install() {
     log_info "Menjalankan MANUAL install Nextcloud (occ maintenance:install)..."
     log_info "  Admin: admin / $NC_ADMIN_EMAIL"
 
-    # Clean slate — hapus CAN_INSTALL, autoconfig, dan config.php (termasuk 0-byte)
     docker exec --user www-data nextcloud sh -c '
         rm -f /var/www/html/config/CAN_INSTALL
         rm -f /var/www/html/config/config.php
@@ -1273,7 +1347,7 @@ cat > "$TMP_DIR/meta/BACKUP_INFO.txt" <<INFO
 Backup Timestamp : $TIMESTAMP
 Hostname         : $(hostname)
 Backup Type      : SMART (DB + Config + Addons)
-Script Version   : 2.1.6-smart
+Script Version   : 2.1.7-smart
 
 Included:
   databases/nextcloud.sql        — MariaDB logical dump
