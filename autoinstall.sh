@@ -1,18 +1,18 @@
 #!/bin/bash
 # ==============================================================================
 # HOMELAB STACK INSTALLER — ENTERPRISE EDITION
-# Version: 3.0.1-enterprise (independent services + domain prompt)
+# Version: 2.6.0-enterprise (safe reset: SSD data preserved)
 # ==============================================================================
 set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="3.0.1-enterprise"
+readonly SCRIPT_VERSION="2.6.0-enterprise"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/homelab-installer.log"
 
-# SSD mount point & struktur
+# SSD mount (manual — tidak di-mount oleh script)
 readonly MOUNT_DIR="/mnt/ssd"
 readonly NC_DIR="$MOUNT_DIR/nextcloud"
 readonly NC_DATA="$NC_DIR/data"
@@ -30,10 +30,6 @@ readonly CONFIG_FILE="$CONFIG_DIR/homelab.conf"
 readonly LOCK_FILE="/var/lock/homelab-backup.lock"
 readonly UTIL_DIR="/usr/local/bin"
 
-# Local path
-readonly IMMICH_ML_CACHE="$APP_BASE/immich-machine-learning/model-cache"
-readonly IMMICH_POSTGRES="$APP_BASE/immich/postgres"
-
 readonly MIN_DISK_GB=5
 readonly NC_READY_TIMEOUT=300
 readonly DB_READY_TIMEOUT=180
@@ -47,12 +43,12 @@ readonly C_RED='\033[1;31m'
 readonly C_GREY='\033[0;90m'
 
 SERVER_IP=""
-SERVER_DOMAIN=""
 INPUT_PASSWORD=""
 DB_PASSWORD=""
 TG_BOT_TOKEN=""
 TG_CHAT_ID=""
 RESET_MODE=0
+RESET_ALL_MODE=0
 CHECK_ONLY=0
 START_TIME=$(date +%s)
 
@@ -79,7 +75,7 @@ banner() {
 ╔══════════════════════════════════════════════════════════════╗
 ║                                                              ║
 ║    HOMELAB STACK INSTALLER  —  ENTERPRISE EDITION            ║
-║    Nextcloud  +  Immich  +  Jellyfin  (Independent)          ║
+║    Nextcloud  +  Immich  +  Jellyfin                         ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 BANNER
@@ -95,7 +91,8 @@ on_error() {
     log_err "Cek log lengkap: $LOG_FILE"
     echo ""
     echo -e "${C_YELLOW}[i] Tip: untuk reset bersih, jalankan:${C_RESET}"
-    echo -e "    $SCRIPT_NAME --reset"
+    echo -e "    $SCRIPT_NAME --reset        (reset local only, SSD aman)"
+    echo -e "    $SCRIPT_NAME --reset-all    (reset total, HAPUS SSD juga)"
     exit "$exit_code"
 }
 trap 'on_error $LINENO' ERR
@@ -108,6 +105,10 @@ require_root() {
         log_err "Harus dijalankan sebagai root."
         exit 1
     fi
+}
+
+ssd_is_mounted() {
+    mountpoint -q "$MOUNT_DIR" 2>/dev/null
 }
 
 docker_is_healthy() {
@@ -156,17 +157,25 @@ parse_args() {
     local arg
     for arg in "$@"; do
         case "$arg" in
-            --reset|-r)  RESET_MODE=1 ;;
-            --check|-c)  CHECK_ONLY=1 ;;
+            --reset|-r)      RESET_MODE=1 ;;
+            --reset-all)     RESET_ALL_MODE=1 ;;
+            --check|-c)      CHECK_ONLY=1 ;;
             --help|-h)
                 cat <<EOF
 Usage: $SCRIPT_NAME [OPTIONS]
 
 Options:
-  (tanpa opsi)   Install / re-run idempotent (independent services)
-  --reset, -r    Hapus semua container + data (safe: abort jika SSD busy)
-  --check, -c    Hanya pre-flight check (tidak install)
-  --help, -h     Tampilkan bantuan ini
+  (tanpa opsi)     Install / re-run idempotent
+  --reset, -r      Reset LOCAL saja (app + config + restore)
+                   ⚠️  SSD TIDAK dihapus — data user aman
+  --reset-all      Reset TOTAL termasuk SSD (data user HAPUS)
+                   ⚠️  Butuh konfirmasi ganda
+  --check, -c      Pre-flight check (tidak install)
+  --help, -h       Tampilkan bantuan ini
+
+Rekomendasi:
+  Reset aman (SSD aman)        : $SCRIPT_NAME --reset
+  Reset total (SSD juga hapus) : $SCRIPT_NAME --reset-all
 EOF
                 exit 0
                 ;;
@@ -197,30 +206,30 @@ phase_preflight() {
         log_ok "OS: ${PRETTY_NAME:-unknown}"
     fi
 
-    if ! mountpoint -q "$MOUNT_DIR"; then
-        log_warn "$MOUNT_DIR bukan mountpoint (SSD mungkin tidak di-mount)"
-        if [[ ! -d "$MOUNT_DIR" ]]; then
-            log_err "$MOUNT_DIR tidak ada."
-            exit 1
-        fi
-        if ! prompt_yes_no "Lanjutkan pakai folder $MOUNT_DIR (bukan mount)?" "n"; then
-            exit 1
+    # ── Cek SSD mount (INFO saja, tidak wajib untuk reset) ──
+    if ssd_is_mounted; then
+        log_ok "SSD mounted di $MOUNT_DIR"
+
+        local avail_gb
+        avail_gb=$(df -BG "$MOUNT_DIR" 2>/dev/null | awk 'NR==2 {gsub("G","",$4); print $4}')
+        if [[ -n "$avail_gb" ]]; then
+            if [[ "$avail_gb" -lt "$MIN_DISK_GB" ]]; then
+                log_warn "Disk space SSD kurang: ${avail_gb}GB (min ${MIN_DISK_GB}GB)"
+            else
+                log_ok "Disk space SSD: ${avail_gb}GB free"
+            fi
         fi
     else
-        log_ok "SSD mounted di $MOUNT_DIR"
+        log_warn "SSD tidak ter-mount di $MOUNT_DIR"
+        log_warn "Install akan GAGAL kalau SSD tidak di-mount."
+        log_warn "Reset aman (--reset) tetap bisa jalan tanpa SSD."
     fi
 
-    local avail_gb
-    avail_gb=$(df -BG "$MOUNT_DIR" 2>/dev/null | awk 'NR==2 {gsub("G","",$4); print $4}')
-    if [[ -z "$avail_gb" || "$avail_gb" -lt "$MIN_DISK_GB" ]]; then
-        log_err "Disk space kurang (perlu ${MIN_DISK_GB}GB, ada ${avail_gb:-0}GB)."
-        exit 1
-    fi
-    log_ok "Disk space SSD: ${avail_gb}GB free"
-
-    avail_gb=$(df -BG /root 2>/dev/null | awk 'NR==2 {gsub("G","",$4); print $4}')
-    if [[ -n "$avail_gb" && "$avail_gb" -lt "$MIN_DISK_GB" ]]; then
-        log_warn "/root hanya ${avail_gb}GB free"
+    # Cek /root disk
+    local root_avail
+    root_avail=$(df -BG /root 2>/dev/null | awk 'NR==2 {gsub("G","",$4); print $4}')
+    if [[ -n "$root_avail" && "$root_avail" -lt "$MIN_DISK_GB" ]]; then
+        log_warn "/root hanya ${root_avail}GB free"
     fi
 }
 
@@ -272,7 +281,6 @@ load_config() {
         DB_PASSWORD=$(config_get DB_PASSWORD)
         TG_BOT_TOKEN=$(config_get TG_BOT_TOKEN)
         TG_CHAT_ID=$(config_get TG_CHAT_ID)
-        SERVER_DOMAIN=$(config_get SERVER_DOMAIN)
         INPUT_PASSWORD="$DB_PASSWORD"
     fi
 }
@@ -285,7 +293,6 @@ save_config() {
 DB_PASSWORD="$INPUT_PASSWORD"
 TG_BOT_TOKEN="$TG_BOT_TOKEN"
 TG_CHAT_ID="$TG_CHAT_ID"
-SERVER_DOMAIN="$SERVER_DOMAIN"
 EOF
     chmod 600 "$tmp"
     mv -f "$tmp" "$CONFIG_FILE"
@@ -299,8 +306,8 @@ prompt_password() {
         if [[ -z "$NEW_PASSWORD" ]]; then
             return 0
         fi
-        read -rsp "Konfirmasi: " CONFIRM; echo ""
-        if [[ "$NEW_PASSWORD" != "$CONFIRM" ]]; then
+        read -rsp "Konfirmasi: " NEW_PASSWORD_CONFIRM; echo ""
+        if [[ "$NEW_PASSWORD" != "$NEW_PASSWORD_CONFIRM" ]]; then
             log_err "Password tidak cocok."
             exit 1
         fi
@@ -308,54 +315,12 @@ prompt_password() {
     else
         while true; do
             read -rsp "Password baru: " INPUT_PASSWORD; echo ""
-            read -rsp "Konfirmasi  : " CONFIRM; echo ""
-            if [[ "$INPUT_PASSWORD" == "$CONFIRM" && ${#INPUT_PASSWORD} -ge 8 ]]; then
+            read -rsp "Konfirmasi  : " NEW_PASSWORD_CONFIRM; echo ""
+            if [[ "$INPUT_PASSWORD" == "$NEW_PASSWORD_CONFIRM" && ${#INPUT_PASSWORD} -ge 8 ]]; then
                 break
             fi
             log_warn "Tidak cocok atau kurang dari 8 karakter. Ulangi."
         done
-    fi
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PROMPT DOMAIN
-# ══════════════════════════════════════════════════════════════════════════════
-prompt_domain() {
-    echo -e "\n${C_CYAN}=== Domain Nextcloud (opsional) ===${C_RESET}"
-    echo -e "${C_GREY}  Kosongkan jika akses via IP saja.${C_RESET}"
-    echo -e "${C_GREY}  Contoh: cloud.example.com atau nextcloud.local${C_RESET}"
-    echo ""
-
-    local new_domain
-    if [[ -n "$SERVER_DOMAIN" ]]; then
-        read -rp "Domain baru [Enter = pakai lama: ${SERVER_DOMAIN}]: " new_domain
-        new_domain="${new_domain:-$SERVER_DOMAIN}"
-    else
-        read -rp "Domain: " new_domain
-    fi
-
-    # Validasi format domain (kalau tidak kosong)
-    if [[ -n "$new_domain" ]]; then
-        if [[ "$new_domain" =~ [[:space:]] ]] || \
-           [[ "$new_domain" =~ ^https?:// ]]; then
-            log_err "Domain tidak boleh mengandung spasi atau http://"
-            SERVER_DOMAIN=""
-            return 0
-        fi
-
-        if [[ ! "$new_domain" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-            log_warn "Format domain '$new_domain' tidak standar."
-            if ! prompt_yes_no "Pakai tetap?" "n"; then
-                SERVER_DOMAIN=""
-                return 0
-            fi
-        fi
-
-        SERVER_DOMAIN="$new_domain"
-        log_ok "Domain: $SERVER_DOMAIN"
-    else
-        SERVER_DOMAIN=""
-        log_warn "Domain dikosongkan — Nextcloud hanya akses via IP."
     fi
 }
 
@@ -405,21 +370,18 @@ prompt_telegram() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RESET — Safe mode (stop Docker + umount SSD check)
+# RESET — SAFE MODE (LOCAL ONLY)
 # ══════════════════════════════════════════════════════════════════════════════
-do_reset() {
-    log_step "RESET MODE — Safe stop + wipe"
+do_reset_local() {
+    log_step "RESET LOCAL — Hapus app + config + restore (SSD AMAN)"
 
-    echo -e "${C_RED}"
-    echo "  ⚠️  Semua data berikut akan DIHAPUS PERMANEN:"
-    echo "      • $APP_BASE"
-    echo "      • $NC_DIR         (SSD)"
-    echo "      • $IMMICH_DIR     (SSD)"
-    echo "      • $CONFIG_DIR"
-    echo "      • $RESTORE_DIR"
-    echo "      • Semua container homelab"
-    echo -e "${C_RESET}"
-    echo -e "${C_YELLOW}  ⚠️  Kalau SSD gagal di-unmount → RESET DIBATALKAN"
+    echo -e "${C_YELLOW}"
+    echo "  ℹ️  Mode reset AMAN:"
+    echo "      ✅ Hapus: $APP_BASE"
+    echo "      ✅ Hapus: $CONFIG_DIR"
+    echo "      ✅ Hapus: $RESTORE_DIR"
+    echo "      ✅ Stop semua container"
+    echo "      ❌ SSD ($MOUNT_DIR) TIDAK DISENTUH — data user aman"
     echo -e "${C_RESET}"
     echo ""
 
@@ -429,16 +391,7 @@ do_reset() {
         exit 0
     fi
 
-    local ssd_was_mounted=0
-    local ssd_source=""
-    local docker_was_running=0
-
-    if systemctl is-active --quiet docker 2>/dev/null; then
-        docker_was_running=1
-    fi
-
-    # ── 1. Stop container ──
-    log_info "[1/6] Stop container..."
+    log_info "Stop container..."
     if [[ -f "$COMPOSE_FILE" ]]; then
         (cd "$COMPOSE_DIR" && docker compose down -v --remove-orphans 2>/dev/null) || true
     fi
@@ -446,135 +399,91 @@ do_reset() {
                 immich_server immich_machine_learning immich_redis immich_postgres \
                 jellyfin 2>/dev/null || true
 
-    # ── 2. Stop Docker daemon ──
-    log_info "[2/6] Stop Docker daemon..."
-    systemctl stop docker.socket 2>/dev/null || true
-    systemctl stop docker 2>/dev/null || true
-    systemctl stop containerd 2>/dev/null || true
-
-    local _i=0
-    while systemctl is-active --quiet docker 2>/dev/null; do
-        sleep 1
-        _i=$((_i + 1))
-        if (( _i >= 30 )); then
-            log_warn "  Docker masih active — force kill..."
-            systemctl kill -s SIGKILL docker 2>/dev/null || true
-            sleep 3
-            break
-        fi
-    done
-    log_ok "  Docker stopped"
-
-    # ── 3. Umount SSD (CRITICAL) ──
-    log_info "[3/6] Deteksi + umount SSD..."
-
-    if mountpoint -q "$MOUNT_DIR" 2>/dev/null; then
-        ssd_was_mounted=1
-        ssd_source=$(findmnt -n -o SOURCE "$MOUNT_DIR" 2>/dev/null || echo "")
-        log_warn "  SSD ter-mount di $MOUNT_DIR"
-        [[ -n "$ssd_source" ]] && log_info "    Device: $ssd_source"
-
-        # Umount nested mount (deepest first)
-        local _nested
-        _nested=$(findmnt -rn -o TARGET --submounts "$MOUNT_DIR" 2>/dev/null | sort -r || true)
-        if [[ -n "$_nested" ]]; then
-            while IFS= read -r _m; do
-                [[ -z "$_m" || "$_m" == "$MOUNT_DIR" ]] && continue
-                log_info "    Umount nested: $_m"
-                umount "$_m" 2>/dev/null || umount -l "$_m" 2>/dev/null || \
-                    log_warn "      Gagal: $_m"
-            done <<< "$_nested"
-        fi
-
-        # Umount main
-        log_info "    Umount $MOUNT_DIR..."
-        local umount_ok=0
-        if umount "$MOUNT_DIR" 2>/dev/null; then
-            umount_ok=1
-            log_ok "    Umount OK"
-        elif umount -l "$MOUNT_DIR" 2>/dev/null; then
-            sleep 2
-            if ! mountpoint -q "$MOUNT_DIR" 2>/dev/null; then
-                umount_ok=1
-                log_ok "    Umount (lazy) OK"
-            fi
-        fi
-
-        if (( umount_ok == 0 )); then
-            echo ""
-            log_err "  ❌ GAGAL umount $MOUNT_DIR — device busy!"
-            echo ""
-            echo -e "${C_YELLOW}── Diagnostik proses ──${C_RESET}"
-            command -v fuser >/dev/null 2>&1 && fuser -vm "$MOUNT_DIR" 2>&1 | sed 's/^/    /' || true
-            command -v lsof >/dev/null 2>&1 && lsof +D "$MOUNT_DIR" 2>/dev/null | head -10 | sed 's/^/    /' || true
-            echo ""
-            echo -e "${C_YELLOW}── Cara fix ──${C_RESET}"
-            echo "    1. Cek proses: sudo fuser -vm $MOUNT_DIR"
-            echo "    2. Kill: sudo fuser -km $MOUNT_DIR"
-            echo "    3. Umount manual: sudo umount $MOUNT_DIR"
-            echo "    4. Jalankan ulang: sudo $SCRIPT_NAME --reset"
-            echo ""
-            log_err "RESET DIBATALKAN — TIDAK ADA DATA YANG DIHAPUS"
-            echo ""
-
-            if (( docker_was_running )); then
-                log_info "Restart Docker (rollback)..."
-                systemctl start containerd 2>/dev/null || true
-                systemctl start docker 2>/dev/null || true
-            fi
-            exit 1
-        fi
-    else
-        log_info "  $MOUNT_DIR tidak ter-mount — skip umount"
-    fi
-
-    # ── 4. Hapus data ──
-    log_info "[4/6] Hapus direktori data..."
-
+    log_info "Hapus direktori local..."
     rm -rf "$APP_BASE" "$CONFIG_DIR" "$RESTORE_DIR"
-    log_ok "  Hapus local: $APP_BASE, $CONFIG_DIR, $RESTORE_DIR"
+    rm -rf /tmp/homelab_* 2>/dev/null || true
 
-    if (( ssd_was_mounted )) && [[ -n "$ssd_source" ]]; then
-        if ! mountpoint -q "$MOUNT_DIR" 2>/dev/null; then
-            log_info "  Remount SSD sementara untuk hapus..."
-            mkdir -p "$MOUNT_DIR"
-            if mount "$ssd_source" "$MOUNT_DIR" 2>/dev/null; then
-                rm -rf "$NC_DIR" "$IMMICH_DIR"
-                log_ok "  Hapus SSD: $NC_DIR, $IMMICH_DIR"
-                umount "$MOUNT_DIR" 2>/dev/null || umount -l "$MOUNT_DIR" 2>/dev/null || true
-            else
-                log_warn "  Gagal remount $ssd_source — data SSD TIDAK dihapus"
-            fi
+    log_ok "Reset local selesai."
+    echo ""
+    echo -e "  ${C_GREEN}SSD data preserved:${C_RESET}"
+    echo -e "    📁 $NC_DIR"
+    echo -e "    📁 $IMMICH_DIR"
+    echo ""
+    echo -e "  ${C_CYAN}Untuk install ulang (SSD harus di-mount):${C_RESET}"
+    echo -e "    mount /dev/sdX1 $MOUNT_DIR"
+    echo -e "    $SCRIPT_NAME"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RESET — FULL (INCLUDE SSD)
+# ══════════════════════════════════════════════════════════════════════════════
+do_reset_all() {
+    log_step "RESET ALL — Hapus app + config + SSD"
+
+    echo -e "${C_RED}"
+    echo "  ⚠️  MODE RESET TOTAL — SEMUA DIHAPUS:"
+    echo "      • $APP_BASE"
+    echo "      • $CONFIG_DIR"
+    echo "      • $RESTORE_DIR"
+    echo "      • $NC_DIR         (SSD)"
+    echo "      • $IMMICH_DIR     (SSD)"
+    echo "      • Semua container"
+    echo -e "${C_RESET}"
+    echo ""
+
+    if ! ssd_is_mounted; then
+        log_warn "SSD TIDAK ter-mount di $MOUNT_DIR"
+        log_warn "Data SSD tidak akan terhapus (device tidak accessible)."
+        echo ""
+        if ! prompt_yes_no "Lanjut reset local saja?" "n"; then
+            echo "Dibatalkan."
+            exit 0
         fi
+        do_reset_local
+        return 0
     fi
+
+    # ── Konfirmasi 1 ──
+    read -rp "Ketik 'HAPUS SEMUA' untuk konfirmasi: " CONFIRM1
+    if [[ "$CONFIRM1" != "HAPUS SEMUA" ]]; then
+        echo "Dibatalkan."
+        exit 0
+    fi
+
+    # ── Konfirmasi 2 ──
+    echo ""
+    log_warn "Ini akan menghapus SEMUA data user di SSD:"
+    log_warn "  • Foto Nextcloud"
+    log_warn "  • Foto Immich"
+    log_warn "  • Film Jellyfin"
+    echo ""
+    read -rp "Yakin? Ketik 'YES' untuk lanjut: " CONFIRM2
+    if [[ "$CONFIRM2" != "YES" ]]; then
+        echo "Dibatalkan."
+        exit 0
+    fi
+
+    # ── Stop container ──
+    log_info "Stop container..."
+    if [[ -f "$COMPOSE_FILE" ]]; then
+        (cd "$COMPOSE_DIR" && docker compose down -v --remove-orphans 2>/dev/null) || true
+    fi
+    docker rm -f nextcloud nextcloud_db nextcloud_redis \
+                immich_server immich_machine_learning immich_redis immich_postgres \
+                jellyfin 2>/dev/null || true
+
+    # ── Hapus local ──
+    log_info "Hapus local: $APP_BASE, $CONFIG_DIR, $RESTORE_DIR"
+    rm -rf "$APP_BASE" "$CONFIG_DIR" "$RESTORE_DIR"
+
+    # ── Hapus SSD ──
+    log_info "Hapus SSD: $NC_DIR, $IMMICH_DIR"
+    rm -rf "$NC_DIR" "$IMMICH_DIR"
 
     rm -rf /tmp/homelab_* 2>/dev/null || true
 
-    # ── 5. Restart Docker ──
-    log_info "[5/6] Restart Docker daemon..."
-    systemctl start containerd 2>/dev/null || true
-    systemctl start docker 2>/dev/null || true
-    sleep 3
-    systemctl is-active --quiet docker && log_ok "  Docker running" || log_warn "  Docker tidak start"
-
-    # ── 6. Remount SSD ──
-    log_info "[6/6] Remount SSD..."
-    if (( ssd_was_mounted )) && [[ -n "$ssd_source" ]]; then
-        if ! mountpoint -q "$MOUNT_DIR" 2>/dev/null; then
-            mkdir -p "$MOUNT_DIR"
-            mount "$ssd_source" "$MOUNT_DIR" 2>/dev/null && \
-                log_ok "  SSD remounted: $ssd_source → $MOUNT_DIR" || \
-                log_warn "  Gagal remount — manual: mount $ssd_source $MOUNT_DIR"
-        else
-            log_ok "  SSD masih mounted"
-        fi
-    fi
-
-    echo ""
-    log_ok "Reset selesai."
-    echo -e "     Docker: $(systemctl is-active docker 2>/dev/null || echo unknown)"
-    echo -e "     SSD   : $(mountpoint -q "$MOUNT_DIR" 2>/dev/null && echo "mounted" || echo "not mounted")"
-    echo ""
+    log_ok "Reset TOTAL selesai (local + SSD)."
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -703,15 +612,27 @@ EOF
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 3: PROVISION (independent services)
+# PHASE 3: PROVISION
 # ══════════════════════════════════════════════════════════════════════════════
 phase_provision() {
     log_step "PHASE 3: Storage provisioning"
 
+    # ── SSD WAJIB mounted ──
+    if ! ssd_is_mounted; then
+        log_err "SSD tidak ter-mount di $MOUNT_DIR!"
+        log_err ""
+        log_err "Mount SSD terlebih dahulu:"
+        log_err "  mkdir -p $MOUNT_DIR"
+        log_err "  mount /dev/sdX1 $MOUNT_DIR"
+        log_err ""
+        log_err "Atau setup auto-mount via /etc/fstab."
+        exit 1
+    fi
+
     # ── SSD structure ──
-    mkdir -p "$NC_DATA"                # → /var/www/html/data
-    mkdir -p "$NC_EXT"                 # → /mnt/external_storage
-    mkdir -p "$NC_MEDIA"               # → /media (Jellyfin)
+    mkdir -p "$NC_DATA"
+    mkdir -p "$NC_EXT"
+    mkdir -p "$NC_MEDIA"
 
     # Immich: parent + subfolder + marker
     mkdir -p "$IMMICH_DIR"/{library,thumbs,upload,encoded-video,profile,backups}
@@ -722,8 +643,8 @@ phase_provision() {
     # ── Local disk structure ──
     mkdir -p "$APP_BASE/nextcloud/app"
     mkdir -p "$APP_BASE/nextcloud/db"
-    mkdir -p "$IMMICH_POSTGRES"
-    mkdir -p "$IMMICH_ML_CACHE"
+    mkdir -p "$APP_BASE/immich/postgres"
+    mkdir -p "$APP_BASE/immich-machine-learning/model-cache"
     mkdir -p "$APP_BASE/jellyfin/config"
     mkdir -p "$APP_BASE/jellyfin/cache"
     mkdir -p "$RESTORE_DIR"
@@ -743,11 +664,11 @@ phase_provision() {
 
     # Immich (uid 1000)
     chown -R 1000:1000 "$IMMICH_DIR"               2>/dev/null || true
-    chown -R 1000:1000 "$IMMICH_ML_CACHE"          2>/dev/null || true
+    chown -R 1000:1000 "$APP_BASE/immich-machine-learning" 2>/dev/null || true
 
     # Immich postgres (uid 999)
-    chown -R 999:999 "$IMMICH_POSTGRES"            2>/dev/null || true
-    chmod -R 700 "$IMMICH_POSTGRES"                2>/dev/null || true
+    chown -R 999:999 "$APP_BASE/immich/postgres"   2>/dev/null || true
+    chmod -R 700 "$APP_BASE/immich/postgres"       2>/dev/null || true
 
     # Jellyfin (uid 1000)
     chown -R 1000:1000 "$APP_BASE/jellyfin"        2>/dev/null || true
@@ -763,11 +684,8 @@ phase_provision() {
     fi
 
     log_ok "Layout:"
-    echo -e "    ${C_GREY}NC data:${C_RESET}   $NC_DATA"
-    echo -e "    ${C_GREY}NC ext:${C_RESET}    $NC_EXT"
-    echo -e "    ${C_GREY}NC media:${C_RESET}  $NC_MEDIA"
-    echo -e "    ${C_GREY}Immich:${C_RESET}    $IMMICH_DIR"
-    echo -e "    ${C_GREY}Local:${C_RESET}     $APP_BASE"
+    echo -e "    ${C_GREY}SSD:${C_RESET}      $MOUNT_DIR"
+    echo -e "    ${C_GREY}Local:${C_RESET}    $APP_BASE"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -779,13 +697,6 @@ write_compose() {
 
     local pw_escaped
     pw_escaped=$(printf '%s' "$INPUT_PASSWORD" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\$/$$/g')
-
-    # ── Trusted domains: IP server + domain (kalau ada) ──
-    local trusted_domains="$SERVER_IP"
-    if [[ -n "$SERVER_DOMAIN" ]]; then
-        trusted_domains="$SERVER_IP $SERVER_DOMAIN"
-    fi
-    log_info "Trusted domains: $trusted_domains"
 
     cat > "$COMPOSE_FILE" <<EOF
 name: homelab-stack
@@ -811,7 +722,7 @@ services:
       MYSQL_PASSWORD: "${pw_escaped}"
       NEXTCLOUD_ADMIN_USER: admin
       NEXTCLOUD_ADMIN_PASSWORD: "${pw_escaped}"
-      NEXTCLOUD_TRUSTED_DOMAINS: "${trusted_domains}"
+      NEXTCLOUD_TRUSTED_DOMAINS: "localhost nextcloud 40.40.40.1 192.168.1.0/24"
       REDIS_HOST: nextcloud-redis
       REDIS_HOST_PORT: 6379
       PHP_MEMORY_LIMIT: 1G
@@ -927,7 +838,7 @@ services:
     volumes:
       - /root/homelab/jellyfin/config:/config
       - /root/homelab/jellyfin/cache:/cache
-      - /mnt/ssd/nextcloud/external_storage/media:/media:ro
+      - /mnt/ssd/nextcloud/external_storage/media:/media
 EOF
 
     if grep -qP '\t' "$COMPOSE_FILE" 2>/dev/null; then
@@ -1061,6 +972,14 @@ phase_wait_ready() {
             echo -e "${C_YELLOW}── Error yang terdeteksi ──${C_RESET}"
             docker logs nextcloud --tail 100 2>&1 | grep -iE "$err_pattern" | head -5 | sed 's/^/    /' || true
             echo ""
+            echo -e "${C_YELLOW}── Diagnostik ──${C_RESET}"
+            echo "    1. Cek apakah DB bisa di-ping dari container NC:"
+            echo "       docker exec nextcloud getent hosts nextcloud-db"
+            echo "    2. Cek env var yang masuk ke container:"
+            echo "       docker exec nextcloud env | grep MYSQL"
+            echo "    3. Cek koneksi manual ke DB:"
+            echo "       docker exec nextcloud bash -c 'mysql -h nextcloud-db -u nextcloud -p\"\$MYSQL_PASSWORD\" -e \"SELECT 1;\"'"
+            echo ""
             echo -e "${C_YELLOW}── Solusi ──${C_RESET}"
             echo "    $SCRIPT_NAME --reset"
             return 1
@@ -1118,7 +1037,6 @@ phase_tuning() {
     ' 2>/dev/null || true
     docker exec --user root nextcloud a2enmod headers 2>/dev/null || true
 
-    # Enable files_external untuk admin, tapi tanpa auto-register mount
     log_info "Enable files_external app..."
     docker exec --user www-data nextcloud php occ app:enable files_external 2>/dev/null || true
 
@@ -1150,9 +1068,6 @@ set -uo pipefail
 
 readonly LOCK_FILE="/var/lock/homelab-backup.lock"
 readonly CONFIG_FILE="/root/config/homelab.conf"
-readonly MOUNT_DIR="/mnt/ssd"
-readonly NC_DIR="$MOUNT_DIR/nextcloud"
-readonly IMMICH_DIR="$MOUNT_DIR/immich"
 readonly APP_BASE="/root/homelab"
 readonly COMPOSE_DIR="$APP_BASE"
 readonly RESTORE_DIR="/root/restore"
@@ -1308,29 +1223,23 @@ cat > "$TMP_DIR/meta/BACKUP_INFO.txt" <<INFO
 Backup Timestamp : $TIMESTAMP
 Hostname         : $(hostname)
 Backup Type      : SMART (DB + Config + Addons)
-Script Version   : 3.0.1-smart
+Script Version   : 2.6.0-smart
 
 Included:
   databases/nextcloud.sql        — MariaDB logical dump
   databases/immich.sql           — PostgreSQL logical dump
-  nextcloud/config.php           — Main NC config (DB creds, secret)
+  nextcloud/config.php           — Main NC config
   nextcloud/custom_apps/         — User-installed addons
   nextcloud/apps.json            — occ app:list inventory
-  jellyfin/config/               — JF config (tanpa metadata/transcode/cache)
+  jellyfin/config/               — JF config
   compose/docker-compose.yml     — Stack definition
-  meta/homelab.conf              — Secrets (password, telegram, domain)
+  meta/homelab.conf              — Secrets
 
 Excluded (auto-rebuilt from Docker image):
-  nextcloud/app/                 — Base codebase (~400MB)
+  nextcloud/app/                 — Base codebase
   nextcloud/db/                  — Raw MariaDB files
   immich/postgres/               — Raw PostgreSQL files
   jellyfin/cache/                — Regenerable
-
-Restore Notes:
-  1. Semua service akan di-stop
-  2. Config di-copy balik ke /root/homelab
-  3. Database direstore dari SQL dump
-  4. Container akan recreate base codebase otomatis
 INFO
 
 ok "  compose + meta"
@@ -1541,7 +1450,7 @@ warn "RESTORE SMART akan:"
 echo "    1. Stop semua container"
 echo "    2. Restore config (config.php, custom_apps, jellyfin config)"
 echo "    3. Restore database dari SQL dump"
-echo "    4. Container rebuild codebase otomatis dari Docker image"
+echo "    4. Container rebuild codebase otomatis"
 echo ""
 warn "Data user di SSD TIDAK diubah."
 echo ""
@@ -1724,7 +1633,6 @@ cfg_get() { grep -E "^$1=" "$CONFIG_FILE" 2>/dev/null | head -1 | sed -E "s/^$1=
 DB_PASSWORD=$(cfg_get DB_PASSWORD)
 TG_BOT_TOKEN=$(cfg_get TG_BOT_TOKEN)
 TG_CHAT_ID=$(cfg_get TG_CHAT_ID)
-SERVER_DOMAIN=$(cfg_get SERVER_DOMAIN)
 
 echo -e "\n${C_CYAN}=== Konfigurasi Homelab ===${C_RESET}\n"
 
@@ -1749,12 +1657,6 @@ else
         echo -e "${C_RED}✗ Tidak cocok / <8 karakter.${C_RESET}"
     done
 fi
-
-echo ""
-echo -e "${C_YELLOW}── Domain Nextcloud (opsional) ──${C_RESET}"
-read -rp "Domain [${SERVER_DOMAIN:-kosong}]: " NEW_DOMAIN
-NEW_DOMAIN="${NEW_DOMAIN:-$SERVER_DOMAIN}"
-SERVER_DOMAIN="$NEW_DOMAIN"
 
 echo ""
 echo -e "${C_YELLOW}── Telegram ──${C_RESET}"
@@ -1787,7 +1689,6 @@ cat > "$TMP" <<EOF
 DB_PASSWORD="$DB_PASSWORD"
 TG_BOT_TOKEN="$TG_BOT_TOKEN"
 TG_CHAT_ID="$TG_CHAT_ID"
-SERVER_DOMAIN="$SERVER_DOMAIN"
 EOF
 chmod 600 "$TMP"
 mv -f "$TMP" "$CONFIG_FILE"
@@ -1854,8 +1755,8 @@ case $- in *i*) ;; *) return ;; esac
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 clear
 echo ""
-echo -e "\e[1;36m\e[1m ⚡ HOMELAB LXC — Enterprise Stack\e[0m"
-echo -e "    Independent Services: Nextcloud | Immich | Jellyfin"
+echo -e "\e[1;36m\e[1m ⚡ HOMELAB — Enterprise Stack\e[0m"
+echo -e "    Nextcloud  |  Immich  |  Jellyfin"
 echo ""
 echo -e "\e[1m  📡 Endpoints\e[0m"
 echo -e "\e[0;90m  ────────────────────────────\e[0m"
@@ -1868,6 +1769,8 @@ echo -e "\e[0;90m  ────────────────────�
 echo -e "  📦 \e[1;36mautobackup\e[0m   Stop → dump DB → Telegram → Start"
 echo -e "  🔄 \e[1;36mautorestore\e[0m  Stop → restore → Start"
 echo -e "  ⚙️  \e[1;36mconfig\e[0m       Ubah parameter"
+echo ""
+echo -e "\e[0;90m  Reset aman (SSD aman): bash autoinstall.sh --reset\e[0m"
 echo ""
 MOTD
     chmod +x /etc/profile.d/99-cloud-motd.sh
@@ -1913,32 +1816,30 @@ phase_healthcheck() {
 print_summary() {
     echo ""
     echo -e "${C_GREEN}╔══════════════════════════════════════════════════════════════╗${C_RESET}"
-    echo -e "${C_GREEN}║  ✅ INSTALASI SELESAI — SEMUA SERVICE BERJALAN!               ║${C_RESET}"
+    echo -e "${C_GREEN}║  ✅ INSTALASI SELESAI — SEMUA SERVICE BERJALAN!              ║${C_RESET}"
     echo -e "${C_GREEN}╚══════════════════════════════════════════════════════════════╝${C_RESET}"
     echo ""
     echo -e "  ${C_CYAN}📡 Endpoints${C_RESET}"
-    echo -e "     📁 Nextcloud : - http://${SERVER_IP}:8080"
-    echo -e "     📸 Immich    : - http://${SERVER_IP}:2283"
-    echo -e "     🎬 Jellyfin  : - http://${SERVER_IP}:8096"
+    echo -e "     📁 Nextcloud : http://${SERVER_IP}:8080"
+    echo -e "     📸 Immich    : http://${SERVER_IP}:2283"
+    echo -e "     🎬 Jellyfin  : http://${SERVER_IP}:8096"
     echo ""
     echo -e "  ${C_CYAN}💾 Storage${C_RESET}"
-    echo -e "     SSD:  $MOUNT_DIR"
-    echo -e "     Local: $APP_BASE"
+    echo -e "     SSD   → $MOUNT_DIR"
+    echo -e "     Local → $APP_BASE"
     echo ""
     echo -e "  ${C_CYAN}🔐 Credentials${C_RESET}"
     echo -e "     User     : admin"
     echo -e "     Password : (lihat $CONFIG_FILE)"
     echo ""
-    if [[ -n "$SERVER_DOMAIN" ]]; then
-        echo -e "  ${C_CYAN}🌐 Domain${C_RESET}"
-        echo -e "     $SERVER_DOMAIN"
-        echo -e "     ${C_YELLOW}ℹ  Setup reverse proxy untuk HTTPS & akses via domain${C_RESET}"
-        echo ""
-    fi
     echo -e "  ${C_CYAN}🛠️  Utilities${C_RESET}"
     echo -e "     ${C_GREEN}autobackup${C_RESET}   — stop → dump → Telegram → start"
     echo -e "     ${C_GREEN}autorestore${C_RESET}  — stop → restore → start"
     echo -e "     ${C_GREEN}config${C_RESET}       — ubah parameter"
+    echo ""
+    echo -e "  ${C_YELLOW}🔄 Reset${C_RESET}"
+    echo -e "     ${C_GREEN}$SCRIPT_NAME --reset${C_RESET}      — reset LOCAL (SSD aman)"
+    echo -e "     ${C_RED}$SCRIPT_NAME --reset-all${C_RESET}  — reset TOTAL (SSD HAPUS)"
     echo ""
     echo -e "  ${C_CYAN}📄 Log:${C_RESET} $LOG_FILE"
     echo ""
@@ -1959,10 +1860,23 @@ main() {
         exit 0
     fi
 
-    if (( RESET_MODE )); then
-        do_reset
+    # ── RESET ALL (dengan SSD) ──
+    if (( RESET_ALL_MODE )); then
+        do_reset_all
+        echo ""
+        echo -e "  ${C_CYAN}Untuk install ulang:${C_RESET}"
+        echo -e "    mount /dev/sdX1 $MOUNT_DIR"
+        echo -e "    $SCRIPT_NAME"
+        exit 0
     fi
 
+    # ── RESET LOCAL (SSD aman) ──
+    if (( RESET_MODE )); then
+        do_reset_local
+        exit 0
+    fi
+
+    # ── Normal install ──
     load_config
 
     if [[ -d "$APP_BASE/nextcloud/db/mysql" && -f "$CONFIG_FILE" ]]; then
@@ -1973,7 +1887,6 @@ main() {
     fi
 
     prompt_password
-    prompt_domain
     prompt_telegram
     save_config
 
