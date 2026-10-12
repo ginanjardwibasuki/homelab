@@ -1913,16 +1913,13 @@ phase_healthcheck() {
 print_summary() {
     echo ""
     echo -e "${C_GREEN}╔══════════════════════════════════════════════════════════════╗${C_RESET}"
-    echo -e "${C_GREEN}║  ✅ INSTALASI SELESAI — SEMUA SERVICE BERJALAN!              ║${C_RESET}"
+    echo -e "${C_GREEN}║  ✅ INSTALASI SELESAI — SEMUA SERVICE BERJALAN!               ║${C_RESET}"
     echo -e "${C_GREEN}╚══════════════════════════════════════════════════════════════╝${C_RESET}"
     echo ""
     echo -e "  ${C_CYAN}📡 Endpoints${C_RESET}"
-    echo -e "     📁 Nextcloud : http://${SERVER_IP}:8080"
-    if [[ -n "$SERVER_DOMAIN" ]]; then
-        echo -e "                    http://${SERVER_DOMAIN}:8080"
-    fi
-    echo -e "     📸 Immich    : http://${SERVER_IP}:2283"
-    echo -e "     🎬 Jellyfin  : http://${SERVER_IP}:8096"
+    echo -e "     📁 Nextcloud : - http://${SERVER_IP}:8080"
+    echo -e "     📸 Immich    : - http://${SERVER_IP}:2283"
+    echo -e "     🎬 Jellyfin  : - http://${SERVER_IP}:8096"
     echo ""
     echo -e "  ${C_CYAN}💾 Storage${C_RESET}"
     echo -e "     SSD:  $MOUNT_DIR"
