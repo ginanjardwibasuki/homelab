@@ -1,14 +1,14 @@
 #!/bin/bash
 # ==============================================================================
 # HOMELAB STACK INSTALLER — ENTERPRISE EDITION
-# Version: 2.3.0-enterprise (mount manager + tuning terpisah)
+# Version: 2.3.1-enterprise (mount manager + auto chmod/chown)
 # ==============================================================================
 set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="2.3.0-enterprise"
+readonly SCRIPT_VERSION="2.3.1-enterprise"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/homelab-installer.log"
 
@@ -178,9 +178,108 @@ mount_list() {
     echo ""
     echo -e "  Total: ${C_GREEN}${count}${C_RESET} mount(s)"
     echo ""
-    echo -e "  Hapus mount:"
-    echo -e "    ${C_GREEN}sudo $SCRIPT_NAME --mount delete <name>${C_RESET}"
+    echo -e "  Perintah:"
+    echo -e "    ${C_GREEN}sudo $SCRIPT_NAME --mount add${C_RESET}                # tambah mount"
+    echo -e "    ${C_GREEN}sudo $SCRIPT_NAME --mount delete <name>${C_RESET}      # hapus mount"
+    echo -e "    ${C_GREEN}sudo $SCRIPT_NAME --mount fix-perms [name|all]${C_RESET}  # fix permission"
     echo ""
+}
+
+# ── Helper: apply chown + chmod ke folder mount ──
+mount_apply_perms() {
+    local name="$1" service="$2" host_path="$3" mode="$4" perm_mode="${5:-auto}"
+
+    if [[ ! -d "$host_path" ]]; then
+        log_warn "  Folder tidak ada: $host_path"
+        return 1
+    fi
+
+    # ── Tentukan ownership sesuai service ──
+    local uid gid
+    case "$service" in
+        nextcloud)     uid=33;   gid=33 ;;
+        immich-server) uid=1000; gid=1000 ;;
+        jellyfin)      uid=1000; gid=1000 ;;
+        *)             log_warn "  Service '$service' tidak dikenal, skip chown"; return 1 ;;
+    esac
+
+    # ── Tentukan permission ──
+    local perm setgid=0
+    if [[ "$perm_mode" == "auto" ]]; then
+        if [[ "$mode" == "ro" ]]; then
+            perm="755"
+        else
+            perm="775"
+            setgid=1
+        fi
+    else
+        perm="$perm_mode"
+        # Cek apakah mode berisi setgid (4 digit dengan awalan 2)
+        if [[ "$perm" =~ ^2 ]]; then
+            setgid=1
+        fi
+    fi
+
+    log_info "  chown -R ${uid}:${gid} $host_path"
+    chown -R "${uid}:${gid}" "$host_path" 2>/dev/null || true
+
+    log_info "  chmod -R $perm $host_path"
+    chmod -R "$perm" "$host_path" 2>/dev/null || true
+
+    # Apply setgid ke folder supaya file baru inherit group
+    if (( setgid == 1 )); then
+        find "$host_path" -type d -exec chmod g+s {} \; 2>/dev/null || true
+        log_info "  setgid: ON (file baru inherit group)"
+    fi
+
+    # Verifikasi
+    local actual
+    actual=$(stat -c '%a %U:%G' "$host_path" 2>/dev/null || echo "?")
+    log_ok "  Final: $actual"
+}
+
+# ── Fix permission mount yang sudah terdaftar ──
+mount_fix_perms() {
+    local target="${1:-all}"
+
+    if [[ ! -f "$MOUNTS_FILE" ]] || [[ ! -s "$MOUNTS_FILE" ]]; then
+        log_err "Tidak ada mount terdaftar di $MOUNTS_FILE"
+        exit 1
+    fi
+
+    echo ""
+    echo -e "${C_CYAN}═══════════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "${C_CYAN}  FIX PERMISSIONS — target: $target${C_RESET}"
+    echo -e "${C_CYAN}═══════════════════════════════════════════════════════════════${C_RESET}"
+    echo ""
+
+    if [[ "$target" == "all" ]]; then
+        local count=0
+        while IFS='|' read -r name service host_path container_path mode; do
+            [[ -z "$name" || "$name" =~ ^# ]] && continue
+            echo ""
+            log_info "▸ [$name] service=$service mode=$mode"
+            mount_apply_perms "$name" "$service" "$host_path" "$mode" "auto"
+            count=$((count + 1))
+        done < "$MOUNTS_FILE"
+        echo ""
+        log_ok "Total $count mount difix."
+    else
+        local line
+        line=$(grep "^${target}|" "$MOUNTS_FILE" | head -1)
+        if [[ -z "$line" ]]; then
+            log_err "Mount '$target' tidak ditemukan."
+            echo ""
+            mount_list
+            exit 1
+        fi
+
+        IFS='|' read -r name service host_path container_path mode <<< "$line"
+        log_info "▸ [$name] service=$service mode=$mode"
+        mount_apply_perms "$name" "$service" "$host_path" "$mode" "auto"
+        echo ""
+        log_ok "Mount '$target' difix."
+    fi
 }
 
 mount_add() {
@@ -248,9 +347,11 @@ mount_add() {
     fi
 
     if [[ "$service" == "nextcloud" ]] && \
-       [[ "$container_path" =~ ^/var/www/html/data/ ]]; then
-        log_err "❌ DILARANG bind mount ke /var/www/html/data/*"
-        log_err "   Ini akan BLOCKER install Nextcloud (folder user dianggap exist)."
+       [[ "$container_path" == "/var/www/html/data" ]] || \
+       [[ "$container_path" =~ ^/var/www/html/data/ ]] || \
+       [[ "$container_path" == "/var/www/html" ]]; then
+        log_err "❌ DILARANG bind mount ke /var/www/html/data atau /var/www/html"
+        log_err "   Ini akan BLOCKER install Nextcloud."
         log_err ""
         log_err "   Pakai: ${C_GREEN}/mnt/shared${C_RESET} lalu aktifkan via"
         log_err "   Nextcloud UI → Settings → External Storage"
@@ -266,21 +367,49 @@ mount_add() {
         *) log_err "Mode harus 'ro' atau 'rw'."; exit 1 ;;
     esac
 
+    # ── Permission mode ──
+    echo ""
+    echo "  Permission mode:"
+    echo "    1) Auto — ikut mode mount (recommended)"
+    echo "         ro → 755 (read-only)"
+    echo "         rw → 2775 (write) + setgid"
+    echo "    2) 755  — owner rwx, group rx, other rx"
+    echo "    3) 775  — owner+group rwx, other rx"
+    echo "    4) 2775 — 775 + setgid (file baru inherit group)"
+    echo "    5) 700  — owner only (private)"
+    echo "    6) Custom"
+    echo ""
+    read -rp "  Pilih [1-6] (default 1): " perm_choice
+    perm_choice="${perm_choice:-1}"
+
+    local perm_mode
+    case "$perm_choice" in
+        1) perm_mode="auto" ;;
+        2) perm_mode="755" ;;
+        3) perm_mode="775" ;;
+        4) perm_mode="2775" ;;
+        5) perm_mode="700" ;;
+        6)
+            read -rp "  Masukkan permission (mis. 750): " perm_mode
+            if [[ ! "$perm_mode" =~ ^[0-7]{3,4}$ ]]; then
+                log_err "Format permission tidak valid."
+                exit 1
+            fi
+            ;;
+        *)
+            log_warn "Pilihan tidak valid, pakai 'auto'."
+            perm_mode="auto" ;;
+    esac
+
+    # ── Buat folder ──
     echo ""
     log_info "Membuat folder: $host_path"
     mkdir -p "$host_path"
 
-    case "$service" in
-        nextcloud)
-            chown -R 33:33 "$host_path" 2>/dev/null || true
-            log_info "  Owner: www-data (33:33)"
-            ;;
-        immich-server|jellyfin)
-            chown -R 1000:1000 "$host_path" 2>/dev/null || true
-            log_info "  Owner: uid 1000"
-            ;;
-    esac
+    # ── Apply chown + chmod ──
+    mount_apply_perms "$name" "$service" "$host_path" "$mode" "$perm_mode"
 
+    # ── Simpan ke config ──
     mkdir -p "$CONFIG_DIR"
     echo "${name}|${service}|${host_path}|${container_path}|${mode}" >> "$MOUNTS_FILE"
     log_ok "Mount '$name' disimpan."
@@ -421,8 +550,10 @@ parse_args() {
                         mount_add ;;
                     delete|rm|remove)
                         mount_delete "${1:-}" ;;
+                    fix-perms|fix)
+                        mount_fix_perms "${1:-all}" ;;
                     *)
-                        echo "Usage: $SCRIPT_NAME --mount {list|add|delete <name>}"
+                        echo "Usage: $SCRIPT_NAME --mount {list|add|delete <name>|fix-perms [name|all]}"
                         exit 1 ;;
                 esac
                 exit 0 ;;
@@ -437,9 +568,10 @@ Options:
   --tuning, -t                Wait ready + tuning Nextcloud saja
 
   --mount list                Lihat daftar mount terdaftar
-  --mount add                 Tambah mount baru (interaktif)
+  --mount add                 Tambah mount baru (interaktif, auto chmod+chown)
   --mount delete <name>       Hapus mount berdasarkan nama
   --mount rm <name>           Alias untuk delete
+  --mount fix-perms [name]    Perbaiki permission mount (default: all)
 
   --help, -h                  Tampilkan bantuan ini
 EOF
@@ -1347,7 +1479,7 @@ cat > "$TMP_DIR/meta/BACKUP_INFO.txt" <<INFO
 Backup Timestamp : $TIMESTAMP
 Hostname         : $(hostname)
 Backup Type      : SMART (DB + Config + Addons)
-Script Version   : 2.3.0-smart
+Script Version   : 2.3.1-smart
 
 Included:
   databases/nextcloud.sql        — MariaDB logical dump
